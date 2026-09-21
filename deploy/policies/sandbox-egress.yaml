@@ -1,0 +1,4 @@
+defaultAction: deny
+allowedHosts: []
+dns:
+  mode: dns+nft

@@ -3,6 +3,7 @@ name = "scilab-control-plane"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "opensandbox==1.1.0",
     "psycopg[binary]>=3,<4",
     "pydantic>=2,<3",
 ]
@@ -10,6 +11,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "jsonschema>=4,<5",
+    "pyyaml>=6,<7",
     "pytest>=8,<9",
     "rfc3339-validator>=0.1,<1",
 ]
