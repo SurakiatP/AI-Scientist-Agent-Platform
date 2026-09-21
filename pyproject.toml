@@ -1,0 +1,20 @@
+[project]
+name = "scilab-control-plane"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pydantic>=2,<3",
+]
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4,<5",
+    "pytest>=8,<9",
+    "rfc3339-validator>=0.1,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["services/control-plane/src"]

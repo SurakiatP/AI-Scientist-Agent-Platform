@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "HermesManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "image": {"title": "Image", "type": "string"},
+        "config_sha256": {"title": "Config Sha256", "type": "string"},
+        "model_aliases": {"$ref": "#/$defs/ModelAliases"}
+      },
+      "required": ["image", "config_sha256", "model_aliases"],
+      "title": "HermesManifest",
+      "type": "object"
+    },
+    "ManifestClaim": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {"title": "Id", "type": "string"},
+        "text": {"title": "Text", "type": "string"},
+        "evidence": {"items": {"type": "string"}, "title": "Evidence", "type": "array"},
+        "confidence": {"maximum": 1, "minimum": 0, "title": "Confidence", "type": "number"}
+      },
+      "required": ["id", "text", "evidence", "confidence"],
+      "title": "ManifestClaim",
+      "type": "object"
+    },
+    "ManifestCost": {
+      "additionalProperties": false,
+      "properties": {
+        "tokens_in": {"title": "Tokens In", "type": "integer"},
+        "tokens_out": {"title": "Tokens Out", "type": "integer"},
+        "llm_thb": {"title": "Llm Thb", "type": "number"},
+        "compute_thb": {"title": "Compute Thb", "type": "number"}
+      },
+      "required": ["tokens_in", "tokens_out", "llm_thb", "compute_thb"],
+      "title": "ManifestCost",
+      "type": "object"
+    },
+    "ManifestInput": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {"title": "Artifact Id", "type": "string"},
+        "sha256": {"title": "Sha256", "type": "string"},
+        "name": {"title": "Name", "type": "string"}
+      },
+      "required": ["artifact_id", "sha256", "name"],
+      "title": "ManifestInput",
+      "type": "object"
+    },
+    "ManifestStep": {
+      "additionalProperties": false,
+      "properties": {
+        "n": {"title": "N", "type": "integer"},
+        "role": {"title": "Role", "type": "string"},
+        "delegation_id": {"title": "Delegation Id", "type": "string"},
+        "commands_log": {"title": "Commands Log", "type": "string"},
+        "outputs": {"items": {"type": "string"}, "title": "Outputs", "type": "array"}
+      },
+      "required": ["n", "role", "delegation_id", "commands_log", "outputs"],
+      "title": "ManifestStep",
+      "type": "object"
+    },
+    "ModelAliases": {
+      "additionalProperties": false,
+      "properties": {
+        "pi": {"title": "Pi", "type": "string"},
+        "child": {"title": "Child", "type": "string"}
+      },
+      "required": ["pi", "child"],
+      "title": "ModelAliases",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"title": "Run Id", "type": "string"},
+    "lab_id": {"title": "Lab Id", "type": "string"},
+    "actor": {"title": "Actor", "type": "string"},
+    "source": {"enum": ["web", "rest", "a2a", "mcp"], "title": "Source", "type": "string"},
+    "goal": {"title": "Goal", "type": "string"},
+    "skill_packs": {"items": {"type": "string"}, "title": "Skill Packs", "type": "array"},
+    "hermes": {"$ref": "#/$defs/HermesManifest"},
+    "skills_image": {"title": "Skills Image", "type": "string"},
+    "sandbox_image": {"title": "Sandbox Image", "type": "string"},
+    "inputs": {"items": {"$ref": "#/$defs/ManifestInput"}, "title": "Inputs", "type": "array"},
+    "steps": {"items": {"$ref": "#/$defs/ManifestStep"}, "title": "Steps", "type": "array"},
+    "claims": {"items": {"$ref": "#/$defs/ManifestClaim"}, "title": "Claims", "type": "array"},
+    "cost": {"$ref": "#/$defs/ManifestCost"},
+    "sealed_at": {"format": "date-time", "title": "Sealed At", "type": "string"},
+    "manifest_sha256": {"title": "Manifest Sha256", "type": "string"}
+  },
+  "required": [
+    "run_id",
+    "lab_id",
+    "actor",
+    "source",
+    "goal",
+    "skill_packs",
+    "hermes",
+    "skills_image",
+    "sandbox_image",
+    "inputs",
+    "steps",
+    "claims",
+    "cost",
+    "sealed_at",
+    "manifest_sha256"
+  ],
+  "title": "RunManifest",
+  "type": "object"
+}

@@ -1,0 +1,547 @@
+{
+  "$defs": {
+    "ApprovalPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": {
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "policy_rule": {
+          "title": "Policy Rule",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "preview": {
+          "additionalProperties": true,
+          "title": "Preview",
+          "type": "object"
+        }
+      },
+      "required": [
+        "approval_id",
+        "action",
+        "reason",
+        "policy_rule",
+        "expires_at",
+        "preview"
+      ],
+      "title": "ApprovalPayload",
+      "type": "object"
+    },
+    "ArtifactPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "produced_by_step": {
+          "title": "Produced By Step",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "kind",
+        "uri",
+        "sha256",
+        "bytes",
+        "produced_by_step"
+      ],
+      "title": "ArtifactPayload",
+      "type": "object"
+    },
+    "CompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "report_artifact_id": {
+          "title": "Report Artifact Id",
+          "type": "string"
+        },
+        "manifest_artifact_id": {
+          "title": "Manifest Artifact Id",
+          "type": "string"
+        },
+        "claims_count": {
+          "title": "Claims Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "summary",
+        "report_artifact_id",
+        "manifest_artifact_id",
+        "claims_count"
+      ],
+      "title": "CompletedPayload",
+      "type": "object"
+    },
+    "CostPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "tokens_in": {
+          "title": "Tokens In",
+          "type": "integer"
+        },
+        "tokens_out": {
+          "title": "Tokens Out",
+          "type": "integer"
+        },
+        "llm_cost_thb": {
+          "title": "Llm Cost Thb",
+          "type": "number"
+        },
+        "compute_cost_thb": {
+          "title": "Compute Cost Thb",
+          "type": "number"
+        },
+        "budget_remaining_thb": {
+          "title": "Budget Remaining Thb",
+          "type": "number"
+        }
+      },
+      "required": [
+        "tokens_in",
+        "tokens_out",
+        "llm_cost_thb",
+        "compute_cost_thb",
+        "budget_remaining_thb"
+      ],
+      "title": "CostPayload",
+      "type": "object"
+    },
+    "DelegationPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "delegation_id": {
+          "title": "Delegation Id",
+          "type": "string"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "child_count": {
+          "title": "Child Count",
+          "type": "integer"
+        },
+        "schema_valid": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Schema Valid"
+        }
+      },
+      "required": [
+        "delegation_id",
+        "role",
+        "goal",
+        "child_count"
+      ],
+      "title": "DelegationPayload",
+      "type": "object"
+    },
+    "RunStatePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "title": "From",
+          "type": "string"
+        },
+        "to": {
+          "title": "To",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "reason"
+      ],
+      "title": "RunStatePayload",
+      "type": "object"
+    },
+    "ToolPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        },
+        "args_redacted": {
+          "additionalProperties": true,
+          "title": "Args Redacted",
+          "type": "object"
+        },
+        "duration_ms": {
+          "title": "Duration Ms",
+          "type": "integer"
+        },
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "required": [
+        "tool",
+        "args_redacted",
+        "duration_ms",
+        "ok"
+      ],
+      "title": "ToolPayload",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.state"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RunStatePayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool.finished"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ToolPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "delegation.started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DelegationPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "delegation.finished"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DelegationPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "approval.required"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ApprovalPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "artifact.registered"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ArtifactPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "cost.updated"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CostPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.completed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CompletedPayload"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "lab_id": {
+      "title": "Lab Id",
+      "type": "string"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "run.state",
+        "tool.started",
+        "tool.progress",
+        "tool.finished",
+        "delegation.started",
+        "delegation.finished",
+        "approval.required",
+        "artifact.registered",
+        "cost.updated",
+        "run.completed",
+        "run.failed"
+      ],
+      "title": "Type",
+      "type": "string"
+    },
+    "seq": {
+      "title": "Seq",
+      "type": "integer"
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/RunStatePayload"
+        },
+        {
+          "$ref": "#/$defs/ToolPayload"
+        },
+        {
+          "$ref": "#/$defs/DelegationPayload"
+        },
+        {
+          "$ref": "#/$defs/ApprovalPayload"
+        },
+        {
+          "$ref": "#/$defs/ArtifactPayload"
+        },
+        {
+          "$ref": "#/$defs/CostPayload"
+        },
+        {
+          "$ref": "#/$defs/CompletedPayload"
+        }
+      ],
+      "title": "Payload"
+    },
+    "source": {
+      "enum": [
+        "hermes",
+        "run-service",
+        "policy",
+        "sandbox"
+      ],
+      "title": "Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event_id",
+    "run_id",
+    "lab_id",
+    "ts",
+    "type",
+    "seq",
+    "payload",
+    "source"
+  ],
+  "title": "RunEvent",
+  "type": "object"
+}

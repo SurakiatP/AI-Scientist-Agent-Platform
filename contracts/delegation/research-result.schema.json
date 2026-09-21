@@ -1,0 +1,25 @@
+{
+  "$defs": {
+    "ResearchClaim": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {"title": "Text", "type": "string"},
+        "evidence": {"items": {"type": "string"}, "title": "Evidence", "type": "array"},
+        "confidence": {"maximum": 1, "minimum": 0, "title": "Confidence", "type": "number"}
+      },
+      "required": ["text", "evidence", "confidence"],
+      "title": "ResearchClaim",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "claims": {"items": {"$ref": "#/$defs/ResearchClaim"}, "title": "Claims", "type": "array"},
+    "artifacts": {"items": {"type": "string"}, "title": "Artifacts", "type": "array"},
+    "caveats": {"items": {"type": "string"}, "title": "Caveats", "type": "array"},
+    "next_steps": {"items": {"type": "string"}, "title": "Next Steps", "type": "array"}
+  },
+  "required": ["claims", "artifacts", "caveats"],
+  "title": "ResearchResult",
+  "type": "object"
+}
