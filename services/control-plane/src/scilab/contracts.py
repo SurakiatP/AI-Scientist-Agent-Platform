@@ -94,7 +94,7 @@ class CostPayload(StrictModel):
     tokens_out: int
     llm_cost_thb: float
     compute_cost_thb: float
-    budget_remaining_thb: float
+    budget_remaining_thb: float | None
 
 
 class CompletedPayload(StrictModel):

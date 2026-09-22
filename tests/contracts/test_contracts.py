@@ -201,6 +201,13 @@ def test_tor_payloads_validate(event_type, payload):
     assert RunEvent.model_validate(event)
 
 
+def test_cost_event_allows_explicitly_unbudgeted_run():
+    payload = {**VALID_PAYLOADS["cost.updated"], "budget_remaining_thb": None}
+    event = {**VALID_EVENT, "type": "cost.updated", "payload": payload}
+
+    assert RunEvent.model_validate(event)
+
+
 @pytest.mark.parametrize("event_type,payload", [("tool.progress", {"progress": 0.5}), ("run.failed", {"error": 123})])
 def test_generic_payloads_remain_json_objects(event_type, payload):
     event = {**VALID_EVENT, "type": event_type, "payload": payload}

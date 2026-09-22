@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scilab-observability-config
+  labels:
+    app.kubernetes.io/name: scilab-control-plane
+    app.kubernetes.io/part-of: ai-scientist-agent-platform
+data:
+  observability.yaml: |
+    correlation:
+      baggage: [run_id, lab_id]
+      traces: Langfuse
+      metrics: Prometheus
+      dashboards: Grafana
+      logs: Loki
+    llmGateway:
+      provider: LiteLLM
+      requireVirtualKey: true
+      budgetScope: lab
+      currency: THB
+      defaultBudgetTHB: null

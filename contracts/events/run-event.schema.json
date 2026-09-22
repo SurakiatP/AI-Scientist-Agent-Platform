@@ -128,10 +128,17 @@
           "title": "Compute Cost Thb",
           "type": "number"
         },
-        "budget_remaining_thb": {
-          "title": "Budget Remaining Thb",
+    "budget_remaining_thb": {
+      "anyOf": [
+        {
           "type": "number"
+        },
+        {
+          "type": "null"
         }
+      ],
+          "title": "Budget Remaining Thb"
+    }
       },
       "required": [
         "tokens_in",
