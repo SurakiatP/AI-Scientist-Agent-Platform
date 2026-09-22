@@ -115,30 +115,73 @@ class RunService:
         run_id: str,
         operation: Callable[[Run, datetime], Run],
     ) -> Run:
-        now = self.clock()
         with self._access(identity, "runs:write") as cursor:
-            cursor.execute(
-                f"SELECT {self._select} FROM runs "
-                "WHERE lab_id = %s AND id = %s FOR UPDATE",
-                (identity.lab_id, run_id),
+            return self._mutate_with_cursor(
+                cursor, identity, run_id, operation, now=self.clock()
             )
-            row = cursor.fetchone()
-            if row is None:
-                raise RunNotFound("run not found")
-            updated = operation(self._from_row(row), now)
-            values = tuple(getattr(updated, column) for column in self._columns[3:])
-            cursor.execute(
-                """
-                UPDATE runs SET
-                    state = %s, reason = %s, retry_count = %s, max_minutes = %s,
-                    hermes_run_id = %s, created_at = %s, updated_at = %s,
-                    queued_at = %s, running_since = %s, runtime_used = %s,
-                    last_heartbeat_at = %s, approval_expires_at = %s
-                WHERE lab_id = %s AND id = %s
-                """,
-                values + (identity.lab_id, run_id),
-            )
-            return updated
+
+    def _mutate_with_cursor(
+        self,
+        cursor: Any,
+        identity: Identity,
+        run_id: str,
+        operation: Callable[[Run, datetime], Run],
+        *,
+        now: datetime,
+    ) -> Run:
+        cursor.execute(
+            f"SELECT {self._select} FROM runs "
+            "WHERE lab_id = %s AND id = %s FOR UPDATE",
+            (identity.lab_id, run_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RunNotFound("run not found")
+        updated = operation(self._from_row(row), now)
+        values = tuple(getattr(updated, column) for column in self._columns[3:])
+        cursor.execute(
+            """
+            UPDATE runs SET
+                state = %s, reason = %s, retry_count = %s, max_minutes = %s,
+                hermes_run_id = %s, created_at = %s, updated_at = %s,
+                queued_at = %s, running_since = %s, runtime_used = %s,
+                last_heartbeat_at = %s, approval_expires_at = %s
+            WHERE lab_id = %s AND id = %s
+            """,
+            values + (identity.lab_id, run_id),
+        )
+        return updated
+
+    def transition_with_cursor(
+        self,
+        cursor: Any,
+        identity: Identity,
+        run_id: str,
+        target: RunState,
+        *,
+        reason: str | None = None,
+        hermes_run_id: str | None = None,
+        completion_ready: bool = False,
+    ) -> Run:
+        require_scope(identity, "runs:write")
+        try:
+            target = RunState(target)
+        except ValueError as exc:
+            raise RunStateError(f"unknown run state: {target!r}") from exc
+        return self._mutate_with_cursor(
+            cursor,
+            identity,
+            run_id,
+            lambda run, now: apply_transition(
+                run,
+                target,
+                now,
+                reason=reason,
+                hermes_run_id=hermes_run_id,
+                completion_ready=completion_ready,
+            ),
+            now=self.clock(),
+        )
 
     def transition(
         self,
