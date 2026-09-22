@@ -1,0 +1,23 @@
+source:
+  repository: https://github.com/K-Dense-AI/scientific-agent-skills.git
+  tag: v2.69.0
+  commit: 45af7aefb40e0ef12fda62c6f01d1067ea1e1222
+skills:
+  - name: paper-lookup
+    license: MIT
+  - name: scientific-writing
+    license: MIT
+  - name: peer-review
+    license: MIT
+  - name: experimental-design
+    license: MIT
+  - name: statistical-analysis
+    license: MIT
+  - name: scientific-critical-thinking
+    license: MIT
+  - name: hypothesis-generation
+    license: MIT
+policy:
+  scan_max_age_days: 7
+  python: ">=3.13,<3.14"
+  runtime_mount: read-only
