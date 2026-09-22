@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -152,10 +154,14 @@ class SandboxBroker:
         *,
         image: str = "ubuntu:22.04",
         vault_binder: CredentialVaultBinder | None = None,
+        action_gate: Any | None = None,
+        allow_ungated_actions: bool = False,
     ) -> None:
         self.client = client
         self.image = image
         self.vault_binder = vault_binder
+        self.action_gate = action_gate
+        self.allow_ungated_actions = allow_ungated_actions
 
     async def for_role(
         self,
@@ -239,13 +245,67 @@ class SandboxBroker:
             sandbox=sandbox,
         )
 
-    async def run(self, handle: SandboxHandle, command: Any) -> Any:
-        return await self.client.run(handle.sandbox, command)
+    async def run(
+        self,
+        handle: SandboxHandle,
+        command: Any,
+        *,
+        identity: Any | None = None,
+        effect: str | None = None,
+        args_redacted: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if self.action_gate is None:
+            if not self.allow_ungated_actions:
+                raise RuntimeError("approval gate is required for sandbox execution")
+            return await self.client.run(handle.sandbox, command)
+        if identity is None:
+            raise ValueError("identity is required when approval gating is configured")
+        if identity.lab_id != handle.lab_id:
+            raise ValueError("identity and sandbox must belong to the same Lab")
+        preview = dict(args_redacted or {})
+        preview["command_sha256"] = hashlib.sha256(
+            json.dumps(command, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        return await self.action_gate.execute(
+            identity,
+            handle.run_id,
+            action="sandbox.run",
+            effect=effect,
+            args_redacted=preview,
+            executor=lambda: self.client.run(handle.sandbox, command),
+        )
 
-    async def upload(self, handle: SandboxHandle, path: str, content: bytes) -> Any:
+    async def upload(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        content: bytes,
+        *,
+        identity: Any | None = None,
+        effect: str | None = None,
+        args_redacted: Mapping[str, Any] | None = None,
+    ) -> Any:
         if not path.strip():
             raise ValueError("path must be non-blank")
-        return await self.client.upload(handle.sandbox, path, content)
+        if self.action_gate is None:
+            if not self.allow_ungated_actions:
+                raise RuntimeError("approval gate is required for sandbox upload")
+            return await self.client.upload(handle.sandbox, path, content)
+        if identity is None:
+            raise ValueError("identity is required when approval gating is configured")
+        if identity.lab_id != handle.lab_id:
+            raise ValueError("identity and sandbox must belong to the same Lab")
+        preview = dict(args_redacted or {})
+        preview["path"] = path
+        preview["content_sha256"] = hashlib.sha256(content).hexdigest()
+        return await self.action_gate.execute(
+            identity,
+            handle.run_id,
+            action="sandbox.upload",
+            effect=effect,
+            args_redacted=preview,
+            executor=lambda: self.client.upload(handle.sandbox, path, content),
+        )
 
     async def download(self, handle: SandboxHandle, path: str) -> bytes:
         if not path.strip():

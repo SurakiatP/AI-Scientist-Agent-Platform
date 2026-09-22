@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from datetime import timedelta
 
 import pytest
@@ -67,6 +69,18 @@ class RaisingVaultBinder:
 
     async def bind(self, sandbox, vault_ref):
         raise self.error_type("bind failed")
+
+
+class RecordingActionGate:
+    def __init__(self, *, blocked: bool = False) -> None:
+        self.blocked = blocked
+        self.calls = []
+
+    async def execute(self, identity, run_id, **kwargs):
+        self.calls.append((identity, run_id, kwargs["action"], kwargs["effect"], kwargs["args_redacted"]))
+        if self.blocked:
+            raise RuntimeError("approval required")
+        return await kwargs["executor"]()
 
 
 def test_non_code_role_does_not_allocate_sandbox():
@@ -157,7 +171,7 @@ def test_vault_bind_failure_always_destroys_created_sandbox(error_type):
 def test_sandbox_runs_exports_artifact_and_cleans_up():
     async def scenario():
         client = RecordingSandboxClient()
-        broker = SandboxBroker(client)
+        broker = SandboxBroker(client, allow_ungated_actions=True)
         handle = await broker.create_for_agent(
             "agent-1",
             "run-1",
@@ -178,6 +192,78 @@ def test_sandbox_runs_exports_artifact_and_cleans_up():
             "upload",
             "download",
             "destroy",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_sandbox_run_routes_through_configured_approval_gate_before_execution():
+    async def scenario():
+        from scilab.identity import Identity
+
+        client = RecordingSandboxClient()
+        ungated = SandboxBroker(client)
+        ungated_handle = await ungated.create_for_agent(
+            "agent-0",
+            "run-0",
+            lab_id="lab-a",
+            needs_tools=True,
+            run_timeout=timedelta(minutes=5),
+        )
+        with pytest.raises(RuntimeError, match="approval gate"):
+            await ungated.run(ungated_handle, ["python", "analysis.py"])
+        assert [call[0] for call in client.calls] == ["create"]
+
+        client = RecordingSandboxClient()
+        gate = RecordingActionGate(blocked=True)
+        broker = SandboxBroker(client, action_gate=gate)
+        handle = await broker.create_for_agent(
+            "agent-1",
+            "run-1",
+            lab_id="lab-a",
+            needs_tools=True,
+            run_timeout=timedelta(minutes=5),
+        )
+        actor = Identity("lab-a", "user:researcher", frozenset({"runs:write"}))
+
+        with pytest.raises(RuntimeError, match="approval required"):
+            await broker.run(
+                handle,
+                ["python", "analysis.py"],
+                identity=actor,
+                effect="unknown",
+                args_redacted={"command": "[REDACTED]"},
+            )
+        with pytest.raises(RuntimeError, match="approval required"):
+            await broker.upload(
+                handle,
+                "/workspace/result.txt",
+                b"result",
+                identity=actor,
+                effect="external_write",
+                args_redacted={"path": "/forged/path.txt"},
+            )
+
+        assert [call[0] for call in client.calls] == ["create"]
+        command_digest = hashlib.sha256(
+            json.dumps(["python", "analysis.py"], separators=(",", ":")).encode()
+        ).hexdigest()
+        content_digest = hashlib.sha256(b"result").hexdigest()
+        assert gate.calls == [
+            (
+                actor,
+                "run-1",
+                "sandbox.run",
+                "unknown",
+                {"command": "[REDACTED]", "command_sha256": command_digest},
+            ),
+            (
+                actor,
+                "run-1",
+                "sandbox.upload",
+                "external_write",
+                {"path": "/workspace/result.txt", "content_sha256": content_digest},
+            ),
         ]
 
     asyncio.run(scenario())
