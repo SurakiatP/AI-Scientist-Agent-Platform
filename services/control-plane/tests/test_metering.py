@@ -53,7 +53,7 @@ class Cursor:
 
         if compact.startswith("select set_config"):
             self.database.current_lab_id = params[1]
-        elif compact.startswith("select id, lab_id, state, reason from runs"):
+        elif compact.startswith("select id, lab_id, state, reason, budget_thb from runs"):
             run = self.database.runs.get((params[0], params[1]))
             self.result = [run] if run else []
         elif compact.startswith("select id, lab_id, idempotency_key, state"):
@@ -64,9 +64,10 @@ class Cursor:
                 "state", "reason", "retry_count", "max_minutes", "hermes_run_id",
                 "created_at", "updated_at", "queued_at", "running_since",
                 "runtime_used", "last_heartbeat_at", "approval_expires_at", "context_id",
+                "budget_thb",
             )
-            values = dict(zip(columns, params[:13], strict=True))
-            run = self.database.runs[(params[13], params[14])]
+            values = dict(zip(columns, params[:14], strict=True))
+            run = self.database.runs[(params[14], params[15])]
             run.update(values)
             self.rowcount = 1
         elif compact.startswith("insert into lab_budgets"):
@@ -209,7 +210,7 @@ class Database:
                 "created_at": NOW, "updated_at": NOW, "queued_at": NOW,
                 "running_since": NOW, "runtime_used": timedelta(0),
                 "last_heartbeat_at": NOW, "approval_expires_at": None,
-                "context_id": None,
+                "context_id": None, "budget_thb": None,
             },
             ("lab-b", "run-2"): {
                 "id": "run-2", "lab_id": "lab-b", "idempotency_key": "key-b",
@@ -218,7 +219,7 @@ class Database:
                 "created_at": NOW, "updated_at": NOW, "queued_at": NOW,
                 "running_since": NOW, "runtime_used": timedelta(0),
                 "last_heartbeat_at": NOW, "approval_expires_at": None,
-                "context_id": None,
+                "context_id": None, "budget_thb": None,
             },
         }
         self.usage: list[dict[str, Any]] = []
@@ -363,6 +364,27 @@ def test_budget_exhaustion_is_atomic_and_event_is_delivered_after_transition() -
     }
     with pytest.raises(RunStateError):
         record(meter, identity(), "run-1")
+
+
+def test_run_budget_records_one_overshoot_then_denies_later_usage() -> None:
+    database = Database()
+    database.runs[("lab-a", "run-1")]["budget_thb"] = 5
+    events = EventSink(database)
+    meter = MeteringService(database, event_service=events, clock=lambda: NOW)
+
+    record(meter, identity(), "run-1", llm_cost_thb=4)
+    crossing_charge = record(meter, identity(), "run-1", llm_cost_thb=2)
+
+    assert crossing_charge.cost_thb == 2
+    assert sum(row["llm_cost_thb"] for row in database.usage) == 6
+    assert database.runs[("lab-a", "run-1")]["state"] == "cancelled"
+    assert database.runs[("lab-a", "run-1")]["reason"] == "budget_exhausted"
+    assert events.states_at_publish == ["running", "cancelled"]
+
+    with pytest.raises(RunStateError):
+        record(meter, identity(), "run-1", llm_cost_thb=0.25)
+
+    assert len(database.usage) == len(database.audit) == len(database.outbox) == 2
 
 
 def test_event_failure_keeps_committed_cancellation_and_retryable_outbox() -> None:

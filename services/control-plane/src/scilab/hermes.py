@@ -133,6 +133,38 @@ class HermesClient:
             )
         return response.json()
 
+    async def chat_completion(
+        self,
+        lab_id: str,
+        *,
+        model: str,
+        messages: list[Mapping[str, str]],
+    ) -> str:
+        if not messages:
+            raise ValueError("messages must not be empty")
+        request = {
+            "model": _nonblank(model, "model"),
+            "messages": [dict(message) for message in messages],
+            "stream": False,
+        }
+        async with self._semaphore:
+            response = await self._transport.request(
+                "POST",
+                self._url(lab_id, "/v1/chat/completions"),
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=request,
+            )
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            raise ValueError("Hermes completion response must be an object")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+            raise ValueError("Hermes completion response has no choices")
+        message = choices[0].get("message")
+        if not isinstance(message, Mapping):
+            raise ValueError("Hermes completion response has no assistant message")
+        return _nonblank(message.get("content"), "completion content")
+
     async def ask_lab(
         self,
         lab_id: str,

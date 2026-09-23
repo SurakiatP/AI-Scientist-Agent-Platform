@@ -68,6 +68,8 @@ def test_verified_mcp_requires_exact_audience_and_takes_lab_and_scopes_from_toke
     identity = identity_from_verified_mcp(
         {
             "aud": "mcp.scilab",
+            "scilab_principal_type": "client",
+            "sub": "service-account-subject",
             "client_id": "agent-1",
             "lab_id": "lab-a",
             "scopes": ["runs:read"],
@@ -80,6 +82,7 @@ def test_verified_mcp_requires_exact_audience_and_takes_lab_and_scopes_from_toke
         identity_from_verified_mcp(
             {
                 "aud": "other",
+                "scilab_principal_type": "client",
                 "client_id": "agent-1",
                 "lab_id": "lab-a",
                 "scopes": ["runs:read"],
@@ -87,16 +90,27 @@ def test_verified_mcp_requires_exact_audience_and_takes_lab_and_scopes_from_toke
         )
     with pytest.raises(AuthenticationError):
         identity_from_verified_mcp(
-            {"client_id": "agent-1", "lab_id": "lab-a", "scopes": ["runs:read"]}
-        )
-    with pytest.raises(AuthenticationError):
-        identity_from_verified_mcp(
-            {"aud": "mcp.scilab", "client_id": "agent-1", "scopes": ["runs:read"]}
+            {
+                "scilab_principal_type": "client",
+                "client_id": "agent-1",
+                "lab_id": "lab-a",
+                "scopes": ["runs:read"],
+            }
         )
     with pytest.raises(AuthenticationError):
         identity_from_verified_mcp(
             {
                 "aud": "mcp.scilab",
+                "scilab_principal_type": "client",
+                "client_id": "agent-1",
+                "scopes": ["runs:read"],
+            }
+        )
+    with pytest.raises(AuthenticationError):
+        identity_from_verified_mcp(
+            {
+                "aud": "mcp.scilab",
+                "scilab_principal_type": "client",
                 "client_id": "agent-1",
                 "lab_id": "lab-a",
                 "scopes": [],
@@ -183,9 +197,15 @@ def test_verified_oidc_requires_subject_bound_membership(membership):
 @pytest.mark.parametrize(
     "token",
     [
-        {"aud": "mcp.scilab", "lab_id": "lab-a", "scopes": ["runs:read"]},
         {
             "aud": "mcp.scilab",
+            "scilab_principal_type": "client",
+            "lab_id": "lab-a",
+            "scopes": ["runs:read"],
+        },
+        {
+            "aud": "mcp.scilab",
+            "scilab_principal_type": "client",
             "client_id": "",
             "lab_id": "lab-a",
             "scopes": ["runs:read"],
@@ -197,11 +217,65 @@ def test_verified_mcp_requires_client_id_from_verified_token(token):
         identity_from_verified_mcp(token)
 
 
+def test_verified_mcp_maps_user_to_verified_subject():
+    identity = identity_from_verified_mcp(
+        {
+            "aud": "mcp.scilab",
+            "scilab_principal_type": "user",
+            "sub": "alice-sub",
+            "client_id": "web-client",
+            "lab_id": "lab-a",
+            "scopes": ["runs:read"],
+        }
+    )
+
+    assert identity == Identity("lab-a", "user:alice-sub", frozenset({"runs:read"}))
+
+
+def test_verified_mcp_accepts_jwt_audience_array_and_ignores_oauth_scopes():
+    identity = identity_from_verified_mcp(
+        {
+            "aud": ["account", "mcp.scilab"],
+            "scilab_principal_type": "user",
+            "sub": "alice-sub",
+            "lab_id": "lab-a",
+            "scopes": ["openid", "profile", "runs:read"],
+        }
+    )
+    assert identity.scopes == frozenset({"runs:read"})
+
+
+@pytest.mark.parametrize(
+    ("principal_type", "identity_claims"),
+    [
+        (None, {"sub": "alice-sub", "client_id": "web-client"}),
+        ("service", {"sub": "alice-sub", "client_id": "agent-1"}),
+        ("user", {"client_id": "web-client"}),
+        ("client", {"sub": "service-account-subject"}),
+    ],
+)
+def test_verified_mcp_rejects_missing_mismatched_or_ambiguous_principal_claims(
+    principal_type, identity_claims
+):
+    token = {
+        "aud": "mcp.scilab",
+        "lab_id": "lab-a",
+        "scopes": ["runs:read"],
+        **identity_claims,
+    }
+    if principal_type is not None:
+        token["scilab_principal_type"] = principal_type
+
+    with pytest.raises(AuthenticationError):
+        identity_from_verified_mcp(token)
+
+
 def test_verified_mcp_has_no_untrusted_parallel_client_id_input():
     with pytest.raises(TypeError):
         identity_from_verified_mcp(
             {
                 "aud": "mcp.scilab",
+                "scilab_principal_type": "client",
                 "client_id": "verified-agent",
                 "lab_id": "lab-a",
                 "scopes": ["runs:read"],

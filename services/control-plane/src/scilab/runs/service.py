@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
 from scilab.identity import Identity
-from scilab.runs.model import Run, RunState, utc_now
+from scilab.runs.model import Run, RunState, _normalize_budget_thb, utc_now
 from scilab.runs.state import RunStateError, apply_retry, apply_transition
 from scilab.tenancy import require_scope
 
@@ -35,6 +35,7 @@ class RunService:
         "last_heartbeat_at",
         "approval_expires_at",
         "context_id",
+        "budget_thb",
     )
     _select = ", ".join(_columns)
 
@@ -67,8 +68,10 @@ class RunService:
         *,
         max_minutes: int = 120,
         context_id: str | None = None,
+        budget_thb: float | None = None,
     ) -> Run:
         self._require_key(idempotency_key)
+        budget_thb = _normalize_budget_thb(budget_thb)
         if context_id is not None and (
             not isinstance(context_id, str) or not context_id.strip()
         ):
@@ -84,8 +87,8 @@ class RunService:
                     id, lab_id, idempotency_key, state, reason, retry_count,
                     max_minutes, hermes_run_id, created_at, updated_at, queued_at,
                     running_since, runtime_used, last_heartbeat_at,
-                    approval_expires_at, context_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    approval_expires_at, context_id, budget_thb
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (lab_id, idempotency_key) DO NOTHING
                 """,
                 (
@@ -105,6 +108,7 @@ class RunService:
                     None,
                     None,
                     context_id,
+                    budget_thb,
                 ),
             )
             cursor.execute(
@@ -154,7 +158,7 @@ class RunService:
                 hermes_run_id = %s, created_at = %s, updated_at = %s,
                 queued_at = %s, running_since = %s, runtime_used = %s,
                 last_heartbeat_at = %s, approval_expires_at = %s,
-                context_id = %s
+                context_id = %s, budget_thb = %s
             WHERE lab_id = %s AND id = %s
             """,
             values + (identity.lab_id, run_id),

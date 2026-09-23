@@ -74,6 +74,61 @@ def test_start_run_uses_the_lab_runs_endpoint_and_protocol_headers() -> None:
     asyncio.run(scenario())
 
 
+def test_chat_completion_uses_stateless_openai_compatible_endpoint() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    {
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "The report records a 42 percent response rate.",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        hermes = client(transport)
+        complete = getattr(hermes, "chat_completion", None)
+        assert callable(complete), "HermesClient needs a separate chat completion method"
+
+        answer = await complete(
+            "lab-a",
+            model="scilab-test-model",
+            messages=[
+                {"role": "system", "content": "Answer from supplied evidence."},
+                {"role": "user", "content": "What was the response rate?"},
+            ],
+        )
+
+        assert answer == "The report records a 42 percent response rate."
+        assert transport.calls == [
+            {
+                "method": "POST",
+                "url": "https://hermes-a.internal/v1/chat/completions",
+                "headers": {"Authorization": "Bearer api-key-1"},
+                "json": {
+                    "model": "scilab-test-model",
+                    "messages": [
+                        {"role": "system", "content": "Answer from supplied evidence."},
+                        {"role": "user", "content": "What was the response rate?"},
+                    ],
+                    "stream": False,
+                },
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_start_run_rejects_a_response_without_run_id() -> None:
     async def scenario() -> None:
         transport = FakeTransport([FakeResponse({"id": "legacy-id"})])
