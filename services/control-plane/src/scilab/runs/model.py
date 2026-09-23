@@ -35,6 +35,7 @@ class Run:
     runtime_used: timedelta
     last_heartbeat_at: datetime | None
     approval_expires_at: datetime | None
+    context_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "lab_id", "idempotency_key"):
@@ -46,6 +47,10 @@ class Run:
             not isinstance(self.hermes_run_id, str) or not self.hermes_run_id.strip()
         ):
             raise ValueError("hermes_run_id must be non-blank when provided")
+        if self.context_id is not None and (
+            not isinstance(self.context_id, str) or not self.context_id.strip()
+        ):
+            raise ValueError("context_id must be non-blank when provided")
         if self.retry_count < 0 or self.retry_count > 2:
             raise ValueError("retry_count must be between 0 and 2")
         if self.max_minutes <= 0:

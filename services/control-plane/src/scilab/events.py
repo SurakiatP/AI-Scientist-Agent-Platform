@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -133,11 +133,13 @@ class EventService:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         entropy: Callable[[int], bytes] = os.urandom,
+        push_notification: Callable[[RunEvent], Awaitable[None]] | None = None,
     ) -> None:
         self.connection = connection
         self.bus = bus
         self.clock = clock
         self.entropy = entropy
+        self.push_notification = push_notification
 
     @contextmanager
     def _access(self, identity: Identity, scope: str):
@@ -211,6 +213,8 @@ class EventService:
                 subject,
                 json.dumps(event_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
             )
+            if event.type == "run.state" and self.push_notification is not None:
+                await self.push_notification(event)
         except Exception as exc:
             raise EventFanoutError(event, exc) from exc
         return event

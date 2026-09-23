@@ -63,10 +63,10 @@ class Cursor:
             columns = (
                 "state", "reason", "retry_count", "max_minutes", "hermes_run_id",
                 "created_at", "updated_at", "queued_at", "running_since",
-                "runtime_used", "last_heartbeat_at", "approval_expires_at",
+                "runtime_used", "last_heartbeat_at", "approval_expires_at", "context_id",
             )
-            values = dict(zip(columns, params[:12], strict=True))
-            run = self.database.runs[(params[12], params[13])]
+            values = dict(zip(columns, params[:13], strict=True))
+            run = self.database.runs[(params[13], params[14])]
             run.update(values)
             self.rowcount = 1
         elif compact.startswith("insert into lab_budgets"):
@@ -209,6 +209,7 @@ class Database:
                 "created_at": NOW, "updated_at": NOW, "queued_at": NOW,
                 "running_since": NOW, "runtime_used": timedelta(0),
                 "last_heartbeat_at": NOW, "approval_expires_at": None,
+                "context_id": None,
             },
             ("lab-b", "run-2"): {
                 "id": "run-2", "lab_id": "lab-b", "idempotency_key": "key-b",
@@ -217,6 +218,7 @@ class Database:
                 "created_at": NOW, "updated_at": NOW, "queued_at": NOW,
                 "running_since": NOW, "runtime_used": timedelta(0),
                 "last_heartbeat_at": NOW, "approval_expires_at": None,
+                "context_id": None,
             },
         }
         self.usage: list[dict[str, Any]] = []

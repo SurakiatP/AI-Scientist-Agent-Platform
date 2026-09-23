@@ -53,7 +53,9 @@ class Cursor:
             self.result = self.database.find(params[0], params[1])
         elif compact.startswith("select") and "order by" in compact:
             self.result = self.database.list_lab(params[0])
-        elif compact.startswith("select") and "idempotency_key" in compact:
+        elif compact.startswith("select") and (
+            "where lab_id = %s and idempotency_key = %s" in compact
+        ):
             self.result = self.database.find_key(params[0], params[1])
         elif compact.startswith("select"):
             self.result = self.database.find(params[0], params[1])
@@ -84,6 +86,7 @@ class Database:
         "runtime_used",
         "last_heartbeat_at",
         "approval_expires_at",
+        "context_id",
     )
 
     def __init__(self):
@@ -101,6 +104,7 @@ class Database:
 
     def insert(self, params):
         row = dict(zip(self.columns, params))
+        row.setdefault("context_id", None)
         if not any(
             existing["lab_id"] == row["lab_id"]
             and existing["idempotency_key"] == row["idempotency_key"]
@@ -232,6 +236,30 @@ def test_scope_is_checked_before_database_access():
     with pytest.raises(AuthorizationError):
         service.create(identity("lab-a", "runs:read"), "key")
     assert database.calls == []
+
+
+def test_a2a_context_id_round_trips_without_changing_idempotency():
+    database = Database()
+    service = RunService(database, clock=Clock())
+
+    original = service.create(identity(), "a2a-key", context_id="context-1")
+    duplicate = service.create(identity(), "a2a-key", context_id="context-2")
+
+    assert duplicate == original
+    restarted = RunService(database, clock=Clock())
+    assert restarted.get(identity(), original.id).context_id == "context-1"
+    assert restarted.list(identity("lab-a", "runs:read"))[0].context_id == "context-1"
+    assert restarted.stop(identity(), original.id).context_id == "context-1"
+
+
+def test_a2a_context_migration_is_nullable_and_additive():
+    migration_path = Path("services/control-plane/migrations/007_a2a_context.sql")
+    assert migration_path.exists(), "Wave13 context migration is missing"
+    migration = migration_path.read_text().lower()
+    assert "alter table runs add column if not exists context_id text" in migration
+    assert "context_id text not null" not in migration
+    assert "create table" not in migration
+    assert "alter table runs drop column context_id" in migration
 
 
 def test_migration_declares_run_constraints_index_and_rls():

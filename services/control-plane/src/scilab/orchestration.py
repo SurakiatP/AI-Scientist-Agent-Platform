@@ -84,11 +84,19 @@ class ResearchCycle:
         }
         return {"input": json.dumps(specification, separators=(",", ":"))}
 
-    async def run(self, question: str, *, idempotency_key: str) -> str:
+    async def run(
+        self,
+        question: str,
+        *,
+        idempotency_key: str,
+        session_key: str | None = None,
+    ) -> str:
+        options = {"session_key": session_key} if session_key is not None else {}
         return await self.client.start_run(
             self.lab_id,
             self.request(question),
             idempotency_key=idempotency_key,
+            **options,
         )
 
     @staticmethod
