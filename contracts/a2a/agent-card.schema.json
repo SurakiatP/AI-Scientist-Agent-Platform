@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://a2a.scilab.example/contracts/agent-card.schema.json",
+  "title": "SciLab Lab Agent Card",
+  "description": "TOR A.6.3 Lab-scoped discovery card in strict A2A v1 wire format",
+  "type": "object",
+  "required": [
+    "name", "description", "version", "supportedInterfaces",
+    "capabilities", "securitySchemes", "securityRequirements", "defaultInputModes",
+    "defaultOutputModes", "skills"
+  ],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "version": {"const": "1.0"},
+    "supportedInterfaces": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["url", "protocolBinding", "protocolVersion"],
+        "properties": {
+          "url": {"type": "string", "format": "uri", "pattern": "^https://"},
+          "protocolBinding": {"const": "JSONRPC"},
+          "protocolVersion": {"const": "1.0"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["streaming", "pushNotifications"],
+      "properties": {
+        "streaming": {"const": true},
+        "pushNotifications": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "securitySchemes": {
+      "type": "object",
+      "required": ["bearer"],
+      "properties": {
+        "bearer": {
+          "type": "object", "required": ["httpAuthSecurityScheme"],
+          "properties": {
+            "httpAuthSecurityScheme": {
+              "type": "object", "required": ["scheme"],
+              "properties": {"scheme": {"type": "string", "pattern": "^[Bb]earer$"}},
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "securityRequirements": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "required": ["schemes"],
+        "properties": {
+          "schemes": {
+            "type": "object", "required": ["bearer"],
+            "properties": {"bearer": {"type": "object"}},
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "defaultInputModes": {
+      "const": ["text/plain", "application/json"]
+    },
+    "defaultOutputModes": {
+      "const": ["text/plain", "text/markdown", "application/json"]
+    },
+    "skills": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "required": ["id", "name", "tags"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "tags": {"type": "array", "items": {"type": "string"}},
+          "examples": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

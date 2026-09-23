@@ -34,6 +34,7 @@ class RunService:
         "runtime_used",
         "last_heartbeat_at",
         "approval_expires_at",
+        "context_id",
     )
     _select = ", ".join(_columns)
 
@@ -65,8 +66,13 @@ class RunService:
         idempotency_key: str,
         *,
         max_minutes: int = 120,
+        context_id: str | None = None,
     ) -> Run:
         self._require_key(idempotency_key)
+        if context_id is not None and (
+            not isinstance(context_id, str) or not context_id.strip()
+        ):
+            raise ValueError("context_id must be non-blank when provided")
         if max_minutes <= 0:
             raise ValueError("max_minutes must be positive")
         now = self.clock()
@@ -77,8 +83,9 @@ class RunService:
                 INSERT INTO runs (
                     id, lab_id, idempotency_key, state, reason, retry_count,
                     max_minutes, hermes_run_id, created_at, updated_at, queued_at,
-                    running_since, runtime_used, last_heartbeat_at, approval_expires_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    running_since, runtime_used, last_heartbeat_at,
+                    approval_expires_at, context_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (lab_id, idempotency_key) DO NOTHING
                 """,
                 (
@@ -97,6 +104,7 @@ class RunService:
                     timedelta(0),
                     None,
                     None,
+                    context_id,
                 ),
             )
             cursor.execute(
@@ -145,7 +153,8 @@ class RunService:
                 state = %s, reason = %s, retry_count = %s, max_minutes = %s,
                 hermes_run_id = %s, created_at = %s, updated_at = %s,
                 queued_at = %s, running_since = %s, runtime_used = %s,
-                last_heartbeat_at = %s, approval_expires_at = %s
+                last_heartbeat_at = %s, approval_expires_at = %s,
+                context_id = %s
             WHERE lab_id = %s AND id = %s
             """,
             values + (identity.lab_id, run_id),

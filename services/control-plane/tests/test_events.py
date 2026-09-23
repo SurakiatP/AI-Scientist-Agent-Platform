@@ -152,6 +152,26 @@ def test_event_service_is_importable() -> None:
     assert EventService
 
 
+def test_persisted_run_state_event_calls_a2a_push_after_bus_publish() -> None:
+    from scilab.events import EventService
+
+    database = Database()
+    database.add_run("run-1")
+    bus = Bus(database)
+    observed: list[object] = []
+
+    async def push(event: object) -> None:
+        assert database.committed
+        assert len(bus.published) == 1
+        observed.append(event)
+
+    service = EventService(database, bus, clock=lambda: NOW, push_notification=push)
+    event = asyncio.run(
+        service.publish_event(identity(), "run-1", "run.state", event_payload(), "run-service")
+    )
+    assert observed == [event]
+
+
 def test_publish_allocates_monotonic_ulids_and_sequences_per_run() -> None:
     from scilab.events import EventService
 

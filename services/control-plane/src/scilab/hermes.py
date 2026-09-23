@@ -47,11 +47,15 @@ class HermesClient:
             raise ValueError(f"Unknown lab_id: {lab_id}") from exc
         return f"{_nonblank(endpoint, 'endpoint').rstrip('/')}{path}"
 
-    def _headers(self, *, accept: str | None = None) -> dict[str, str]:
+    def _headers(
+        self, *, accept: str | None = None, session_key: str | None = None
+    ) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "X-Hermes-Session-Id": self._session_id,
-            "X-Hermes-Session-Key": self._session_key,
+            "X-Hermes-Session-Key": (
+                _nonblank(session_key, "session_key") if session_key is not None else self._session_key
+            ),
         }
         if accept is not None:
             headers["Accept"] = accept
@@ -63,8 +67,9 @@ class HermesClient:
         request: Mapping[str, object],
         *,
         idempotency_key: str,
+        session_key: str | None = None,
     ) -> str:
-        headers = self._headers()
+        headers = self._headers(session_key=session_key)
         headers["Idempotency-Key"] = _nonblank(idempotency_key, "idempotency_key")
         async with self._semaphore:
             response = await self._transport.request(

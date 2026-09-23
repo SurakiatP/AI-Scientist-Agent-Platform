@@ -168,6 +168,7 @@ class Database:
             "runtime_used": timedelta(0),
             "last_heartbeat_at": NOW,
             "approval_expires_at": None,
+            "context_id": None,
         }
 
 
