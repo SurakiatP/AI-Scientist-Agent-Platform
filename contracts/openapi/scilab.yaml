@@ -1,0 +1,256 @@
+openapi: 3.1.0
+info:
+  title: SciLab REST API
+  version: 1.0.0
+security:
+  - bearerAuth: []
+paths:
+  /v1/labs/{lab}/runs:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    post:
+      operationId: createRun
+      x-required-scopes: [runs:write]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 1}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RunRequest'}
+      responses:
+        '202':
+          description: Run accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+    get:
+      operationId: listRuns
+      x-required-scopes: [runs:read]
+      parameters:
+        - {name: state, in: query, schema: {type: string}}
+        - {name: actor, in: query, schema: {type: string}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/runs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getRun
+      x-required-scopes: [runs:read]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/runs/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: streamRunEvents
+      x-required-scopes: [runs:read]
+      parameters:
+        - name: from_seq
+          in: query
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        '200':
+          description: Resumable SSE stream with a heartbeat every 15 seconds
+          content:
+            text/event-stream:
+              schema: {type: string}
+  /v1/runs/{id}/stop:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      operationId: stopRun
+      x-required-scopes: [runs:write]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/runs/{id}/approvals/{approval_id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: approval_id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: decideApproval
+      x-required-scopes: [runs:approve]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ApprovalRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/runs/{id}/artifacts:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: listRunArtifacts
+      x-required-scopes: [artifacts:read]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/artifacts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getArtifact
+      description: Returns a presigned URL valid for 15 minutes.
+      x-required-scopes: [artifacts:read]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/labs/{lab}/inputs:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    post:
+      operationId: uploadInput
+      x-required-scopes: [runs:write]
+      requestBody: {$ref: '#/components/requestBodies/Object'}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/labs/{lab}/ask:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    post:
+      operationId: askLab
+      description: Stateless Hermes chat; does not open a sandbox.
+      x-required-scopes: [runs:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [question]
+              properties:
+                question: {type: string, minLength: 1}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/labs/{lab}/skills:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: listSkills
+      x-required-scopes: [runs:read]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/labs/{lab}/api-keys:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: listApiKeys
+      x-required-scopes: [lab:admin]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+    post:
+      operationId: createApiKey
+      x-required-scopes: [lab:admin]
+      requestBody: {$ref: '#/components/requestBodies/Object'}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+    delete:
+      operationId: deleteApiKey
+      x-required-scopes: [lab:admin]
+      parameters:
+        - name: key_id
+          in: query
+          required: true
+          schema: {type: string, minLength: 1}
+      responses:
+        '204':
+          description: Key deleted
+  /v1/labs/{lab}/peers:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: listPeers
+      x-required-scopes: [lab:admin]
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+    post:
+      operationId: createPeer
+      x-required-scopes: [lab:admin]
+      requestBody: {$ref: '#/components/requestBodies/Object'}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+  /v1/labs/{lab}/usage:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: getUsage
+      x-required-scopes: [runs:read]
+      parameters:
+        - name: period
+          in: query
+          required: true
+          schema: {type: string, enum: [daily, monthly]}
+      responses:
+        '200': {$ref: '#/components/responses/Json'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Lab:
+      name: lab
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+  schemas:
+    Object:
+      type: object
+      additionalProperties: true
+    RunRequest:
+      type: object
+      additionalProperties: false
+      required: [goal, inputs, skill_packs, budget]
+      properties:
+        goal: {type: string, minLength: 1}
+        inputs:
+          type: array
+          items: {type: string}
+        skill_packs:
+          type: array
+          items: {type: string}
+        budget:
+          type: object
+          additionalProperties: false
+          required: [thb, max_minutes]
+          properties:
+            thb: {type: number, minimum: 0}
+            max_minutes: {type: integer, minimum: 1}
+        options:
+          type: object
+          additionalProperties: true
+          default: {}
+    ApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: {type: string, enum: [approve, reject]}
+        note: {type: [string, 'null']}
+  requestBodies:
+    Object:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Object'}
+  responses:
+    Json:
+      description: Successful response
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Object'}
