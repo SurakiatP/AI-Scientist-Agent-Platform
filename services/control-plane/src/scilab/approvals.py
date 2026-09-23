@@ -406,15 +406,23 @@ class ApprovalService:
         decision: str,
         *,
         note: str | None = None,
+        run_id: str | None = None,
     ) -> Approval:
         if decision not in {"approve", "reject"}:
             raise ValueError("decision must be approve or reject")
         now = self.clock()
         with self._access(identity, "runs:approve") as cursor:
+            run_filter = " AND run_id = %s" if run_id is not None else ""
+            params = (
+                (identity.lab_id, approval_id, _text(run_id, "run_id"))
+                if run_id is not None
+                else (identity.lab_id, approval_id)
+            )
             cursor.execute(
                 f"SELECT {self._approval_select} FROM approvals "
-                "WHERE lab_id = %s AND id = %s FOR UPDATE /* approval_by_id */",
-                (identity.lab_id, approval_id),
+                f"WHERE lab_id = %s AND id = %s{run_filter} "
+                "FOR UPDATE /* approval_by_id */",
+                params,
             )
             row = cursor.fetchone()
             if row is None:

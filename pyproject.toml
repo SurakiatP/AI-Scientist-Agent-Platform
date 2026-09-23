@@ -3,6 +3,7 @@ name = "scilab-control-plane"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "fastapi>=0.115,<0.130",
     "opensandbox==1.1.0",
     "opentelemetry-api>=1,<2",
     "psycopg[binary]>=3,<4",
@@ -11,7 +12,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28,<1",
     "jsonschema>=4,<5",
+    "openapi-spec-validator>=0.7,<1",
     "pyyaml>=6,<7",
     "pytest>=8,<9",
     "rfc3339-validator>=0.1,<1",

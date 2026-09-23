@@ -90,11 +90,13 @@ class Cursor:
             ]
             return
         if "/* approval_by_id */" in compact:
-            lab_id, approval_id = params
+            lab_id, approval_id, *run_id = params
             self.result = [
                 row
                 for row in self.database.approvals
-                if row["lab_id"] == lab_id and row["id"] == approval_id
+                if row["lab_id"] == lab_id
+                and row["id"] == approval_id
+                and (not run_id or row["run_id"] == run_id[0])
             ]
             return
         if "/* due_approvals */" in compact:
@@ -475,6 +477,34 @@ def test_reject_and_expiry_cancel_run_with_canonical_reason() -> None:
             )
         )
     assert len(approved_db.approvals) == 2
+
+
+def test_approval_decision_is_bound_to_the_run_in_the_public_path() -> None:
+    from scilab.approvals import ActionGate, ApprovalNotFound, ApprovalRequired
+
+    database = Database()
+    database.add_running_run()
+    approval_service = service(database)
+    with pytest.raises(ApprovalRequired) as blocked:
+        asyncio.run(
+            ActionGate(approval_service).execute(
+                identity(),
+                "run-1",
+                action="external.write",
+                effect="external_write",
+                args_redacted={"target": "dataset-1"},
+                executor=lambda: None,
+            )
+        )
+
+    with pytest.raises(ApprovalNotFound):
+        approval_service.decide_approval(
+            identity("lab-a", "runs:approve"),
+            blocked.value.approval.id,
+            "approve",
+            run_id="run-other",
+        )
+    assert database.approvals[0]["status"] == "pending"
 
 
 def test_policy_and_migration_are_fail_safe_tenant_scoped_and_additive() -> None:
