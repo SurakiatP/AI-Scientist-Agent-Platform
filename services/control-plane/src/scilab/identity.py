@@ -87,15 +87,32 @@ def identity_from_verified_oidc(
 def identity_from_verified_mcp(verified_token: Mapping[str, Any]) -> Identity:
     if not isinstance(verified_token, Mapping):
         raise AuthenticationError("verified MCP token must be a mapping")
-    if verified_token.get("aud") != "mcp.scilab":
+    audience = verified_token.get("aud")
+    if audience != "mcp.scilab" and not (
+        isinstance(audience, (list, tuple)) and "mcp.scilab" in audience
+    ):
         raise AuthenticationError("MCP audience must be exactly mcp.scilab")
+
+    principal_type = verified_token.get("scilab_principal_type")
+    if principal_type == "user":
+        principal_field = "sub"
+    elif principal_type == "client":
+        principal_field = "client_id"
+    else:
+        raise AuthenticationError("MCP principal type must be user or client")
+
     try:
-        client_id = _text(verified_token.get("client_id"), "client_id")
+        principal_id = _text(verified_token.get(principal_field), principal_field)
         lab_id = _text(verified_token.get("lab_id"), "lab_id")
+        token_scopes = verified_token.get("scopes")
+        if not isinstance(token_scopes, (list, tuple, set, frozenset)) or any(
+            not isinstance(scope, str) or not scope.strip() for scope in token_scopes
+        ):
+            raise IdentityError("MCP scopes must be non-blank scope strings")
         return Identity(
             lab_id,
-            f"client:{client_id}",
-            verified_token.get("scopes"),
+            f"{principal_type}:{principal_id}",
+            frozenset(token_scopes) & ALL_SCOPES,
         )
     except IdentityError as exc:
         raise AuthenticationError(str(exc)) from exc

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import StrEnum
 
 
@@ -16,6 +18,17 @@ class RunState(StrEnum):
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_budget_thb(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise ValueError("budget_thb must be a non-negative finite number")
+    budget = float(value)
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget_thb must be a non-negative finite number")
+    return budget
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +49,7 @@ class Run:
     last_heartbeat_at: datetime | None
     approval_expires_at: datetime | None
     context_id: str | None = None
+    budget_thb: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "lab_id", "idempotency_key"):
@@ -43,6 +57,7 @@ class Run:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be non-blank")
         object.__setattr__(self, "state", RunState(self.state))
+        object.__setattr__(self, "budget_thb", _normalize_budget_thb(self.budget_thb))
         if self.hermes_run_id is not None and (
             not isinstance(self.hermes_run_id, str) or not self.hermes_run_id.strip()
         ):

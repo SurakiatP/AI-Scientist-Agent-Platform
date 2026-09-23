@@ -172,7 +172,7 @@ class MeteringService:
 
         with self._access(identity, "runs:write") as cursor:
             cursor.execute(
-                "SELECT id, lab_id, state, reason FROM runs "
+                "SELECT id, lab_id, state, reason, budget_thb FROM runs "
                 "WHERE lab_id = %s AND id = %s FOR UPDATE",
                 (identity.lab_id, run_id),
             )
@@ -182,6 +182,8 @@ class MeteringService:
             state = run["state"] if isinstance(run, Mapping) else run[2]
             if state != RunState.RUNNING.value:
                 raise RunStateError("usage can only be recorded for a running Run")
+            run_budget = run.get("budget_thb") if isinstance(run, Mapping) else run[4]
+            run_budget = None if run_budget is None else float(run_budget)
             cursor.execute(
                 "SELECT budget_thb FROM lab_budgets WHERE lab_id = %s FOR UPDATE",
                 (identity.lab_id,),
@@ -246,7 +248,10 @@ class MeteringService:
                     recorded_at,
                 ),
             )
-            if budget is not None and lab_total >= budget:
+            run_total = float(run_totals[2]) + float(run_totals[3])
+            if (run_budget is not None and run_total >= run_budget) or (
+                budget is not None and lab_total >= budget
+            ):
                 self.run_service.transition_with_cursor(
                     cursor,
                     identity,

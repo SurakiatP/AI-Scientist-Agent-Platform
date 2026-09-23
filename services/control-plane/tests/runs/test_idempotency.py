@@ -87,6 +87,7 @@ class Database:
         "last_heartbeat_at",
         "approval_expires_at",
         "context_id",
+        "budget_thb",
     )
 
     def __init__(self):
@@ -157,6 +158,49 @@ def test_duplicate_key_returns_original_and_does_not_change_budget():
     assert duplicate == original
     assert len(database.rows) == 1
     assert database.rows[0]["max_minutes"] == 10
+
+
+def test_run_budget_persists_across_duplicate_create_and_service_restart():
+    database = Database()
+    service = RunService(database, clock=Clock())
+
+    original = service.create(identity(), "budget-key", budget_thb=25)
+    duplicate = service.create(identity(), "budget-key", budget_thb=50)
+    restarted = RunService(database, clock=Clock())
+
+    assert duplicate == original
+    assert duplicate.budget_thb == 25
+    assert restarted.get(identity("lab-a", "runs:read"), original.id).budget_thb == 25
+
+
+def test_run_without_budget_is_unbounded():
+    run = RunService(Database(), clock=Clock()).create(identity(), "unbounded-key")
+
+    assert run.budget_thb is None
+
+
+def test_create_rejects_negative_run_budget_before_database_access():
+    database = Database()
+
+    with pytest.raises(ValueError, match="budget_thb"):
+        RunService(database, clock=Clock()).create(identity(), "invalid-budget", budget_thb=-1)
+
+    assert database.calls == []
+
+
+def test_run_budget_migration_adds_nullable_nonnegative_column():
+    migration_path = (
+        Path(__file__).parents[4]
+        / "services/control-plane/migrations/009_run_budget.sql"
+    )
+    sql = "\n".join(
+        line.split("--", 1)[0] for line in migration_path.read_text().splitlines()
+    )
+
+    assert " ".join(sql.split()).lower() == (
+        "alter table runs add column if not exists budget_thb numeric "
+        "check (budget_thb >= 0);"
+    )
 
 
 def test_same_key_is_allowed_in_another_lab_and_list_is_newest_first():

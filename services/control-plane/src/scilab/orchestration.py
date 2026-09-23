@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from .contracts import ResearchResult
@@ -63,7 +64,13 @@ class ResearchCycle:
             ],
         }
 
-    def request(self, question: str) -> dict[str, Any]:
+    def request(
+        self,
+        question: str,
+        *,
+        inputs: Sequence[str] = (),
+        skill_packs: Sequence[str] = (),
+    ) -> dict[str, Any]:
         specification = {
             "goal": question,
             "stages": [
@@ -82,6 +89,10 @@ class ResearchCycle:
                 },
             },
         }
+        if inputs:
+            specification["inputs"] = list(inputs)
+        if skill_packs:
+            specification["skill_packs"] = list(skill_packs)
         return {"input": json.dumps(specification, separators=(",", ":"))}
 
     async def run(
@@ -90,11 +101,13 @@ class ResearchCycle:
         *,
         idempotency_key: str,
         session_key: str | None = None,
+        inputs: Sequence[str] = (),
+        skill_packs: Sequence[str] = (),
     ) -> str:
         options = {"session_key": session_key} if session_key is not None else {}
         return await self.client.start_run(
             self.lab_id,
-            self.request(question),
+            self.request(question, inputs=inputs, skill_packs=skill_packs),
             idempotency_key=idempotency_key,
             **options,
         )

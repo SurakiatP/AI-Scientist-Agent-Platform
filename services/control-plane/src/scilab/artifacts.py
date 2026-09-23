@@ -23,6 +23,9 @@ class ArtifactConflict(ValueError):
     pass
 
 
+_MAX_KNOWLEDGE_SOURCE_LIMIT = 32
+
+
 @dataclass(frozen=True)
 class Artifact:
     id: str
@@ -191,6 +194,21 @@ class ArtifactService:
             )
             return [self._from_row(row) for row in cursor.fetchall()]
 
+    def list_knowledge_sources(
+        self, identity: Identity, *, limit: int = _MAX_KNOWLEDGE_SOURCE_LIMIT
+    ) -> list[Artifact]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        bounded_limit = min(limit, _MAX_KNOWLEDGE_SOURCE_LIMIT)
+        with self._access(identity, "artifacts:read") as cursor:
+            cursor.execute(
+                f"SELECT {self._select} FROM artifacts "
+                "WHERE lab_id = %s AND kind IN ('document', 'report') "
+                "ORDER BY created_at DESC, id LIMIT %s",
+                (identity.lab_id, bounded_limit),
+            )
+            return [self._from_row(row) for row in cursor.fetchall()]
+
     def get(self, identity: Identity, artifact_id: str) -> Artifact:
         with self._access(identity, "artifacts:read") as cursor:
             cursor.execute(
@@ -205,3 +223,10 @@ class ArtifactService:
     def presign(self, identity: Identity, artifact_id: str) -> str:
         artifact = self.get(identity, artifact_id)
         return self.storage.presign(artifact.uri, expires_in=900)
+
+    def read_bytes(self, identity: Identity, artifact_id: str) -> bytes:
+        artifact = self.get(identity, artifact_id)
+        body = self.storage.read_bytes(artifact.uri)
+        if not isinstance(body, bytes) or hashlib.sha256(body).hexdigest() != artifact.sha256:
+            raise ValueError("artifact content digest mismatch")
+        return body
