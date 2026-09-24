@@ -7,3 +7,15 @@ docs/
 /.integration-hub/
 /AGENTS.md
 /CLAUDE.md
+/apps/web/AGENTS.md
+/apps/web/CLAUDE.md
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Playwright
+playwright-report/
+test-results/
