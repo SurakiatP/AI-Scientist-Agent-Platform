@@ -1,0 +1,15 @@
+{
+  "date": "2026-09-23",
+  "project": "AI Scientist Agent Platform",
+  "scope": "Wave 15 public Thai-first landing page",
+  "findings": {
+    "framework": "New Next.js App Router app in apps/web",
+    "existingDesignSystem": false,
+    "existingFonts": false,
+    "existingPalette": false,
+    "motionLibraries": [],
+    "spacingScale": "New 4-point CSS token scale",
+    "preserved": [],
+    "introduced": ["Cobalt-inspired CSS tokens", "Workbench landing layout", "reduced-motion-safe interactions"]
+  }
+}

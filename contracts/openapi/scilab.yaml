@@ -5,6 +5,98 @@ info:
 security:
   - bearerAuth: []
 paths:
+  /v1/me:
+    get:
+      operationId: getMe
+      description: Verified bearer principal and its active Lab-scoped permissions.
+      responses:
+        '200':
+          description: Current identity
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+  /v1/labs/{lab}/members:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: listLabMembers
+      x-required-scopes: [lab:admin]
+      responses:
+        '200':
+          description: Lab members
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+    post:
+      operationId: addLabMember
+      x-required-scopes: [lab:admin]
+      description: Human Lab owner adds an existing OIDC subject; does not provision an account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Member'}
+      responses:
+        '201':
+          description: Member added
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+  /v1/labs/{lab}/members/{subject}:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+      - name: subject
+        in: path
+        required: true
+        schema: {type: string, minLength: 1}
+    patch:
+      operationId: changeLabMemberRole
+      x-required-scopes: [lab:admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MemberRole'}
+      responses:
+        '200':
+          description: Role changed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+        '409': {description: Cannot demote the final owner}
+    delete:
+      operationId: removeLabMember
+      x-required-scopes: [lab:admin]
+      responses:
+        '204': {description: Member removed}
+        '409': {description: Cannot remove the final owner}
+  /v1/labs/{lab}/budget:
+    parameters:
+      - $ref: '#/components/parameters/Lab'
+    get:
+      operationId: getLabBudget
+      x-required-scopes: [lab:admin]
+      responses:
+        '200':
+          description: Configured THB budget, or null when not configured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LabBudget'}
+    put:
+      operationId: setLabBudget
+      x-required-scopes: [lab:admin]
+      description: Human Lab owner sets or clears the THB budget.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LabBudgetInput'}
+      responses:
+        '200':
+          description: Budget updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LabBudget'}
   /v1/labs/{lab}/runs:
     parameters:
       - $ref: '#/components/parameters/Lab'
@@ -103,6 +195,19 @@ paths:
       x-required-scopes: [artifacts:read]
       responses:
         '200': {$ref: '#/components/responses/Json'}
+  /v1/artifacts/{id}/content:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getArtifactContent
+      x-required-scopes: [artifacts:read]
+      description: Tenant-checked artifact bytes for report, manifest and image previews.
+      responses:
+        '200':
+          description: Verified artifact bytes
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
   /v1/labs/{lab}/inputs:
     parameters:
       - $ref: '#/components/parameters/Lab'
@@ -209,6 +314,52 @@ components:
       required: true
       schema: {type: string, minLength: 1}
   schemas:
+    Me:
+      type: object
+      additionalProperties: false
+      required: [lab_id, principal, scopes]
+      properties:
+        lab_id: {type: string}
+        principal: {type: string}
+        scopes: {type: array, items: {type: string}}
+    Member:
+      type: object
+      additionalProperties: false
+      required: [subject, role]
+      properties:
+        subject: {type: string, minLength: 1}
+        role: {type: string, enum: [owner, researcher, viewer]}
+    MemberRole:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {type: string, enum: [owner, researcher, viewer]}
+    MemberList:
+      type: object
+      additionalProperties: false
+      required: [members]
+      properties:
+        members: {type: array, items: {$ref: '#/components/schemas/Member'}}
+    LabBudget:
+      type: object
+      additionalProperties: false
+      required: [budget_thb]
+      properties:
+        budget_thb:
+          description: Decimal THB encoded as a string to preserve precision; null means unconfigured.
+          type: [string, 'null']
+          pattern: '^[0-9]+(\\.[0-9]+)?$'
+    LabBudgetInput:
+      type: object
+      additionalProperties: false
+      required: [budget_thb]
+      properties:
+        budget_thb:
+          oneOf:
+            - {type: number, minimum: 0}
+            - {type: string, pattern: '^[0-9]+(\\.[0-9]+)?$'}
+            - {type: 'null'}
     Object:
       type: object
       additionalProperties: true

@@ -1,0 +1,26 @@
+:root {
+  --color-paper: oklch(98% .006 255);
+  --color-surface: oklch(100% 0 0);
+  --color-ink: oklch(24% .04 257);
+  --color-muted: oklch(47% .025 257);
+  --color-accent: oklch(48% .19 262);
+  --color-accent-hover: oklch(40% .18 262);
+  --color-rule: oklch(89% .017 255);
+  --color-soft: oklch(94% .014 255);
+  --font-display: "Noto Sans Thai", "Sukhumvit Set", "Arial", sans-serif;
+  --font-body: "Noto Sans Thai", "Sukhumvit Set", "Arial", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", monospace;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 40px;
+  --space-2xl: 64px;
+  --text-display: clamp(2.6rem, 5vw + .6rem, 5rem);
+  --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --ease-in: cubic-bezier(.4, 0, 1, 1);
+  --ease-in-out: cubic-bezier(.4, 0, .2, 1);
+  --dur-fast: 160ms;
+  --rule-thin: 1px solid var(--color-rule);
+  --radius-sm: 6px;
+  --radius-lg: 18px;
+}

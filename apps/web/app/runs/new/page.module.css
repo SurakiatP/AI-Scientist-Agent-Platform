@@ -1,0 +1,28 @@
+.main { max-width: 1220px; margin: 0 auto; padding: clamp(24px, 5vw, 72px) 20px 96px; color: var(--color-ink, #182336); }
+.eyebrow { color: var(--color-accent, #215ca8); font: 600 12px/1.4 ui-monospace, monospace; letter-spacing: .12em; }
+.header { display: flex; justify-content: space-between; align-items: end; gap: 28px; margin: 14px 0 46px; }
+.header h1 { font-size: clamp(36px, 5vw, 64px); line-height: 1.1; letter-spacing: -.04em; margin: 0 0 14px; overflow-wrap: anywhere; }
+.header p { max-width: 55ch; line-height: 1.7; margin: 0; color: var(--color-muted, #546175); }
+.header a { color: var(--color-accent, #215ca8); white-space: nowrap; }
+.links { display: flex; gap: 18px; flex-wrap: wrap; }
+.form { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(290px, 1fr); gap: 18px; align-items: start; }
+.primary, .settings { background: var(--color-surface, #fff); border: 1px solid var(--color-rule, #d6deea); border-radius: 18px; padding: clamp(20px, 3vw, 34px); min-width: 0; }
+.primary { display: grid; gap: 12px; }
+.settings { display: grid; gap: 12px; }
+.settings h2 { font-size: 21px; margin: 0 0 6px; }
+.main label { display: block; font-weight: 650; margin-top: 6px; }
+.main label span, .help { color: var(--color-muted, #546175); font-weight: 400; font-size: 14px; }
+.main textarea, .main input, .main select { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid var(--color-rule, #b9c7d9); border-radius: 10px; background: var(--color-paper, #fff); color: inherit; font: inherit; padding: 12px 14px; }
+.main textarea { resize: vertical; line-height: 1.65; }
+.main input[type=file] { border-style: dashed; }
+.main :is(textarea, input, select):focus-visible, .main button:focus-visible, .main a:focus-visible { outline: 3px solid var(--color-accent, #215ca8); outline-offset: 3px; }
+.two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.help { line-height: 1.6; margin: 4px 0 8px; }
+.error { color: #a02732; line-height: 1.5; }
+.main button { background: var(--color-accent, #215ca8); color: #fff; border: 1px solid transparent; border-radius: 10px; min-height: 48px; padding: 11px 18px; font: inherit; font-weight: 650; cursor: pointer; transition: opacity .16s ease, transform .16s ease; }
+.main button:hover { opacity: .88; }
+.main button:active { transform: translateY(1px); }
+.main button:disabled { opacity: .45; cursor: not-allowed; }
+@media (max-width: 760px) { .header { display: block; } .header a { display: inline-block; margin-top: 18px; } .form { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 380px) { .two { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .main button { transition: none; } }

@@ -43,6 +43,13 @@ class ASGIClient:
 
 
 ROUTES = {
+    ("GET", "/v1/me"),
+    ("GET", "/v1/labs/{lab}/members"),
+    ("POST", "/v1/labs/{lab}/members"),
+    ("PATCH", "/v1/labs/{lab}/members/{subject}"),
+    ("DELETE", "/v1/labs/{lab}/members/{subject}"),
+    ("GET", "/v1/labs/{lab}/budget"),
+    ("PUT", "/v1/labs/{lab}/budget"),
     ("POST", "/v1/labs/{lab}/runs"),
     ("GET", "/v1/labs/{lab}/runs"),
     ("GET", "/v1/runs/{id}"),
@@ -51,6 +58,7 @@ ROUTES = {
     ("POST", "/v1/runs/{id}/approvals/{approval_id}"),
     ("GET", "/v1/runs/{id}/artifacts"),
     ("GET", "/v1/artifacts/{id}"),
+    ("GET", "/v1/artifacts/{id}/content"),
     ("POST", "/v1/labs/{lab}/inputs"),
     ("POST", "/v1/labs/{lab}/ask"),
     ("GET", "/v1/labs/{lab}/skills"),
@@ -170,6 +178,10 @@ class FakeArtifacts:
     def presign(self, identity: Identity, artifact_id: str) -> str:
         self.calls.append(("presign", identity, artifact_id))
         return "https://objects.invalid/a?expires=900"
+
+    def read_bytes(self, identity: Identity, artifact_id: str) -> bytes:
+        self.calls.append(("read_bytes", identity, artifact_id))
+        return b"# verified report"
 
 
 @dataclass
@@ -386,6 +398,18 @@ def test_artifact_get_includes_fifteen_minute_url(api: tuple[Any, Any]) -> None:
     assert [call[0] for call in services.artifacts.calls[-2:]] == ["get", "presign"]
 
 
+def test_artifact_content_requires_scope_and_returns_verified_bytes(api: tuple[Any, Any]) -> None:
+    client, services = api
+    denied = client.get("/v1/artifacts/artifact-1/content", headers={"X-Test-Scopes": "runs:read"})
+    assert denied.status_code == 403
+    assert services.artifacts.calls == []
+    response = client.get("/v1/artifacts/artifact-1/content")
+    assert response.status_code == 200
+    assert response.content == b"# verified report"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert [call[0] for call in services.artifacts.calls] == ["get", "read_bytes"]
+
+
 @pytest.mark.parametrize(
     ("path", "body", "required_scope"),
     [
@@ -515,7 +539,7 @@ def test_checked_in_openapi_31_matches_tor_routes() -> None:
         (method.upper(), route)
         for route, operations in document["paths"].items()
         for method in operations
-        if method.upper() in {"GET", "POST", "DELETE"}
+        if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}
     }
     assert actual == ROUTES
     delete = document["paths"]["/v1/labs/{lab}/api-keys"]["delete"]

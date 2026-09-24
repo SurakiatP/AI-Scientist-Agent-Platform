@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import inspect
+import json
+from decimal import Decimal
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from scilab.identity import Identity
+from scilab.api.lab_admin import LastOwnerError, MemberConflictError
 from scilab.sse import stream_events
 from scilab.tenancy import AuthorizationError, require_lab, require_scope
 
@@ -43,6 +46,26 @@ class AskRequest(BaseModel):
 
     question: str = Field(min_length=1)
 
+class MemberRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subject: str = Field(min_length=1)
+    role: Literal["owner", "researcher", "viewer"]
+
+    @field_validator("subject")
+    @classmethod
+    def non_blank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must be non-blank")
+        return value.strip()
+
+class MemberRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["owner", "researcher", "viewer"]
+
+class LabBudgetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    budget_thb: Decimal | None = Field(ge=0, allow_inf_nan=False)
+
 
 IdentityResolver = Callable[[Request], Identity | Awaitable[Identity]]
 
@@ -75,6 +98,10 @@ def create_app(
     @app.exception_handler(AuthorizationError)
     async def authorization_error(_: Request, exc: AuthorizationError) -> Response:
         return JSONResponse({"detail": str(exc)}, status_code=403)
+    @app.exception_handler(LastOwnerError)
+    async def lab_conflict(_: Request, exc: LastOwnerError | MemberConflictError) -> Response:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+    app.add_exception_handler(MemberConflictError, lab_conflict)
 
     @app.exception_handler(LookupError)
     async def not_found(_: Request, exc: LookupError) -> Response:
@@ -249,5 +276,72 @@ def create_app(
     ) -> Any:
         current = await lab_identity(request, lab, "runs:read")
         return _json(await _call(services.usage.get, current, period))
+
+    @app.get("/v1/me")
+    async def get_me(request: Request) -> Any:
+        current = await identity(request)
+        return {"lab_id": current.lab_id, "principal": current.principal, "scopes": sorted(current.scopes)}
+
+    @app.get("/v1/artifacts/{id}/content")
+    async def get_artifact_content(id: str, request: Request) -> Response:
+        current = await identity(request)
+        require_scope(current, "artifacts:read")
+        artifact = await _call(services.artifacts.get, current, id)
+        body = await _call(services.artifacts.read_bytes, current, id)
+        kind = artifact.get("kind") if isinstance(artifact, Mapping) else getattr(artifact, "kind", None)
+        metadata = artifact.get("metadata", {}) if isinstance(artifact, Mapping) else getattr(artifact, "metadata", {})
+        declared = metadata.get("content_type") if isinstance(metadata, Mapping) else None
+        allowed = {"text/markdown", "text/plain", "application/x-tex", "application/json", "application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif"}
+        media_type = declared if declared in allowed else {"report": "text/markdown", "manifest": "application/json"}.get(kind, "application/octet-stream")
+        return Response(content=body, media_type=media_type, headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"})
+
+    def require_human(current: Identity) -> None:
+        if not current.principal.startswith("user:") or not current.principal[5:]:
+            raise AuthorizationError("Lab mutation requires a human owner")
+
+    @app.get("/v1/labs/{lab}/members")
+    async def list_members(lab: str, request: Request) -> Any:
+        current = await lab_identity(request, lab, "lab:admin")
+        return {"members": _json(await _call(services.lab_admin.list_members, current))}
+
+    @app.post("/v1/labs/{lab}/members", status_code=201)
+    async def add_member(lab: str, body: MemberRequest, request: Request) -> Any:
+        current = await lab_identity(request, lab, "lab:admin")
+        require_human(current)
+        return _json(await _call(services.lab_admin.add_member, current, body.subject.strip(), body.role))
+
+    @app.patch("/v1/labs/{lab}/members/{subject}")
+    async def change_member_role(lab: str, subject: str, body: MemberRoleRequest, request: Request) -> Any:
+        current = await lab_identity(request, lab, "lab:admin")
+        require_human(current)
+        if not subject.strip():
+            raise HTTPException(status_code=422, detail="subject must be non-blank")
+        return _json(await _call(services.lab_admin.change_member_role, current, subject, body.role))
+
+    @app.delete("/v1/labs/{lab}/members/{subject}", status_code=204)
+    async def remove_member(lab: str, subject: str, request: Request) -> Response:
+        current = await lab_identity(request, lab, "lab:admin")
+        require_human(current)
+        if not subject.strip():
+            raise HTTPException(status_code=422, detail="subject must be non-blank")
+        await _call(services.lab_admin.remove_member, current, subject)
+        return Response(status_code=204)
+
+    @app.get("/v1/labs/{lab}/budget")
+    async def get_lab_budget(lab: str, request: Request) -> Any:
+        current = await lab_identity(request, lab, "lab:admin")
+        budget = await _call(services.lab_admin.get_budget, current)
+        return {"budget_thb": str(budget) if budget is not None else None}
+
+    @app.put("/v1/labs/{lab}/budget")
+    async def set_lab_budget(lab: str, request: Request) -> Any:
+        current = await lab_identity(request, lab, "lab:admin")
+        require_human(current)
+        try:
+            body = LabBudgetRequest.model_validate(json.loads(await request.body(), parse_float=Decimal))
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail="invalid Lab budget") from exc
+        await _call(services.lab_admin.set_budget, current, body.budget_thb)
+        return {"budget_thb": str(body.budget_thb) if body.budget_thb is not None else None}
 
     return app
