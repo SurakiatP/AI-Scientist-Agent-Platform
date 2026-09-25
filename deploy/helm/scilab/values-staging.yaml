@@ -1,0 +1,7 @@
+api:
+  replicas: 1
+  ingress:
+    enabled: false
+
+labOperator:
+  replicas: 1

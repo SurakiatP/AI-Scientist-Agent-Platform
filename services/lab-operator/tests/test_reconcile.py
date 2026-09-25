@@ -86,12 +86,14 @@ def test_builder_is_deterministic_and_emits_exact_owned_children() -> None:
     assert first == second
     assert [resource["kind"] for resource in first] == [
         "PersistentVolumeClaim",
+        "ConfigMap",
         "Deployment",
         "Service",
         "NetworkPolicy",
     ]
     assert [resource["metadata"]["name"] for resource in first] == [
         "scilab-alpha-hermes-home",
+        "scilab-alpha-hermes-config",
         "scilab-alpha-hermes",
         "scilab-alpha-hermes",
         "scilab-alpha-hermes-ingress",
@@ -130,6 +132,36 @@ def test_two_labs_have_disjoint_names_and_identity() -> None:
     } == {"beta"}
 
 
+def test_hermes_approval_config_is_lab_owned_and_mounted_read_only() -> None:
+    resources = resources_for()
+    config = by_kind(resources, "ConfigMap")
+    deployment = by_kind(resources, "Deployment")
+    pod = deployment["spec"]["template"]["spec"]
+    hermes = pod["containers"][0]
+
+    assert config["metadata"]["name"] == "scilab-alpha-hermes-config"
+    assert config["metadata"]["ownerReferences"][0]["name"] == "alpha"
+    assert config["data"]["config.yaml"] == "approvals:\n  mode: manual\n  timeout: 86400\n"
+    assert {"name": "hermes-config", "configMap": {"name": config["metadata"]["name"]}} in pod["volumes"]
+    assert {"name": "hermes-config", "mountPath": "/var/lib/hermes/config.yaml", "subPath": "config.yaml", "readOnly": True} in hermes["volumeMounts"]
+    assert {"name": "hermes-config", "mountPath": "/var/lib/hermes/config.yaml", "subPath": "config.yaml", "readOnly": True} not in pod["initContainers"][0]["volumeMounts"]
+
+
+def test_run_worker_gets_opa_url_from_secret() -> None:
+    from lab_operator.resources import build_run_worker
+
+    worker = build_run_worker(
+        "alpha", "research", "uid-alpha", "registry.example/worker@sha256:" + "c" * 64,
+        "scilab-postgres", "scilab-nats", "pi", "reviewer", "scilab-minio",
+        lab_spec()["resources"], "scilab", opa_secret="scilab-opa-test",
+    )
+    env = {item["name"]: item for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["SCILAB_OPA_URL"] == {
+        "name": "SCILAB_OPA_URL",
+        "valueFrom": {"secretKeyRef": {"name": "scilab-opa-test", "key": "SCILAB_OPA_URL"}},
+    }
+
+
 def test_deployment_uses_pinned_images_resources_secrets_and_read_only_skills() -> None:
     deployment = by_kind(resources_for(), "Deployment")
     pod = deployment["spec"]["template"]
@@ -146,7 +178,7 @@ def test_deployment_uses_pinned_images_resources_secrets_and_read_only_skills() 
         {"name": "api", "containerPort": 8642},
         {"name": "a2a", "containerPort": 9900},
     ]
-    assert {item["name"]: item["value"] for item in container["env"]} == {
+    assert {item["name"]: item["value"] for item in container["env"] if "value" in item} == {
         "API_SERVER_ENABLED": "true",
         "HERMES_HOME": "/var/lib/hermes",
     }
@@ -161,6 +193,7 @@ def test_deployment_uses_pinned_images_resources_secrets_and_read_only_skills() 
     assert {volume["name"] for volume in pod["spec"]["volumes"]} == {
         "hermes-home",
         "skills-runtime",
+        "hermes-config",
     }
 
 
@@ -197,7 +230,7 @@ def test_network_policy_allows_only_same_namespace_registered_sources() -> None:
     ]
     assert from_selectors == [
         {"scilab.ai/component": "platform-gateway"},
-        {"scilab.ai/component": "run-service"},
+        {"scilab.ai/component": "run-service", "scilab.ai/lab-id": "alpha"},
         {
             "scilab.ai/component": "hermes-peer",
             "scilab.ai/lab-id": "alpha",
@@ -235,6 +268,7 @@ def test_apply_dispatches_each_kind_with_server_side_apply_arguments() -> None:
 
     assert [call[0] for call in core.calls] == [
         "patch_namespaced_persistent_volume_claim",
+        "patch_namespaced_config_map",
         "patch_namespaced_service",
     ]
     assert [call[0] for call in apps.calls] == ["patch_namespaced_deployment"]
@@ -259,4 +293,4 @@ def test_reconcile_builds_and_applies_instead_of_returning_only_manifests(monkey
 
     assert result is None
     assert len(calls) == 1
-    assert len(calls[0]) == 4
+    assert len(calls[0]) == 5

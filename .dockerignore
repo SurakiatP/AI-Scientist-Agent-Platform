@@ -1,0 +1,15 @@
+*
+!pyproject.toml
+!uv.lock
+!skills/
+!skills/packs/
+!skills/packs/general-research.yaml
+!services/
+services/*
+!services/control-plane/
+services/control-plane/*
+!services/control-plane/src/
+!services/control-plane/src/**
+**/.env*
+**/*.pem
+**/*.key

@@ -4,6 +4,17 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol
+from urllib.parse import quote
+
+_HERMES_DATA_EVENTS = frozenset({"approval.request", "run.completed", "run.failed"})
+
+
+class HermesReceiptConflict(ValueError):
+    """The vendor could not prove the requested approval receipt."""
+
+
+class HermesReceiptUnavailable(RuntimeError):
+    """The vendor approval receipt could not be checked safely."""
 
 
 class HermesTransport(Protocol):
@@ -93,14 +104,30 @@ class HermesClient:
             event_name: str | None = None
             data: list[str] = []
 
+            def normalize(payload: object) -> dict[str, object]:
+                vendor_event = payload.get("event") if isinstance(payload, dict) else None
+                if (
+                    event_name in (None, "message")
+                    and isinstance(payload, dict)
+                    and isinstance(vendor_event, str)
+                    and vendor_event in _HERMES_DATA_EVENTS
+                ):
+                    if payload.get("run_id") != run_id:
+                        raise ValueError("Hermes event run_id does not match requested run_id")
+                    normalized = dict(payload)
+                    if event_id is not None:
+                        normalized.setdefault("id", event_id)
+                    return normalized
+                return {
+                    "id": event_id,
+                    "event": event_name or "message",
+                    "data": payload,
+                }
+
             async for line in response.aiter_lines():
                 if not line:
                     if data:
-                        yield {
-                            "id": event_id,
-                            "event": event_name or "message",
-                            "data": json.loads("\n".join(data)),
-                        }
+                        yield normalize(json.loads("\n".join(data)))
                     event_id = None
                     event_name = None
                     data = []
@@ -118,11 +145,112 @@ class HermesClient:
                     data.append(value)
 
             if data:
-                yield {
-                    "id": event_id,
-                    "event": event_name or "message",
-                    "data": json.loads("\n".join(data)),
-                }
+                yield normalize(json.loads("\n".join(data)))
+
+    async def respond_approval(
+        self, lab_id: str, run_id: str, request_id: str, decision: str
+    ) -> dict[str, object]:
+        if decision not in ("approve", "reject"):
+            raise ValueError("decision must be approve or reject")
+        run_id = _nonblank(run_id, "run_id")
+        request_id = _nonblank(request_id, "request_id")
+        if len(request_id) > 256:
+            raise ValueError("request_id must be at most 256 characters")
+        choice = "once" if decision == "approve" else "deny"
+        async with self._semaphore:
+            response = await self._transport.request(
+                "POST",
+                self._url(lab_id, f"/v1/runs/{run_id}/approval"),
+                headers=self._headers(),
+                json={"choice": choice, "request_id": request_id},
+            )
+        if response.status_code != 200:
+            raise ValueError("Hermes approval was not acknowledged")
+        payload = response.json()
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("object") != "hermes.run.approval_response"
+            or payload.get("run_id") != run_id
+            or payload.get("request_id") != request_id
+            or payload.get("choice") != choice
+            or type(payload.get("resolved")) is not int
+            or payload["resolved"] != 1
+        ):
+            raise ValueError("Hermes approval acknowledgment mismatch")
+        return dict(payload)
+
+    async def approval_receipt(
+        self, lab_id: str, hermes_run_id: str, request_id: str
+    ) -> dict[str, object] | None:
+        hermes_run_id = _nonblank(hermes_run_id, "hermes_run_id")
+        request_id = _nonblank(request_id, "request_id")
+        if len(request_id) > 256:
+            raise ValueError("request_id must be at most 256 characters")
+        url = self._url(
+            lab_id,
+            f"/v1/runs/{quote(hermes_run_id, safe='')}/approvals/"
+            f"{quote(request_id, safe='')}",
+        )
+        headers = self._headers()
+        try:
+            async with self._semaphore:
+                response = await self._transport.request("GET", url, headers=headers)
+        except Exception:
+            raise HermesReceiptUnavailable("Hermes approval receipt unavailable") from None
+
+        if response.status_code == 404:
+            return None
+        if response.status_code == 409:
+            raise HermesReceiptConflict("Hermes approval receipt is not confirmed")
+        if response.status_code != 200:
+            raise HermesReceiptUnavailable("Hermes approval receipt unavailable")
+        try:
+            payload = response.json()
+        except Exception:
+            raise HermesReceiptConflict("Hermes approval receipt response mismatch") from None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("object") != "hermes.run.approval_response"
+            or payload.get("run_id") != hermes_run_id
+            or payload.get("request_id") != request_id
+            or payload.get("choice") not in ("once", "deny")
+            or type(payload.get("resolved")) is not int
+            or payload.get("resolved") != 1
+            or ("state" in payload and payload.get("state") != "committed")
+        ):
+            raise HermesReceiptConflict("Hermes approval receipt response mismatch")
+        return {
+            "object": payload["object"],
+            "run_id": payload["run_id"],
+            "request_id": payload["request_id"],
+            "choice": payload["choice"],
+            "resolved": payload["resolved"],
+        }
+
+    async def run_status(self, lab_id: str, hermes_run_id: str) -> str:
+        hermes_run_id = _nonblank(hermes_run_id, "hermes_run_id")
+        url = self._url(lab_id, f"/v1/runs/{quote(hermes_run_id, safe='')}")
+        headers = self._headers()
+        try:
+            async with self._semaphore:
+                response = await self._transport.request("GET", url, headers=headers)
+        except Exception:
+            raise HermesReceiptUnavailable("Hermes Run status unavailable") from None
+        if response.status_code != 200:
+            raise HermesReceiptUnavailable("Hermes run status unavailable")
+        try:
+            payload = response.json()
+        except Exception:
+            raise ValueError("Hermes run status response mismatch") from None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("run_id") != hermes_run_id
+            or not isinstance(payload.get("status"), str)
+            or not payload["status"].strip()
+            or payload["status"] != payload["status"].strip()
+        ):
+            raise ValueError("Hermes run status response mismatch")
+        return payload["status"]
 
     async def stop(self, lab_id: str, run_id: str) -> Any:
         async with self._semaphore:

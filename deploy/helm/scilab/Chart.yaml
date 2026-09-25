@@ -1,0 +1,6 @@
+apiVersion: v2
+name: scilab
+description: SciLab API and Lab Operator
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

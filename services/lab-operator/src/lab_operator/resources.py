@@ -107,6 +107,13 @@ def build_resources(
             "resources": {"requests": {"storage": spec["pvcSize"]}},
         },
     }
+    hermes_config_name = f"scilab-{lab_id}-hermes-config"
+    hermes_config = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": owner_metadata(hermes_config_name),
+        "data": {"config.yaml": "approvals:\n  mode: manual\n  timeout: 86400\n"},
+    }
     deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -137,10 +144,11 @@ def build_resources(
                                 {"name": "api", "containerPort": 8642},
                                 {"name": "a2a", "containerPort": 9900},
                             ],
-                            "env": [
-                                {"name": "API_SERVER_ENABLED", "value": "true"},
-                                {"name": "HERMES_HOME", "value": "/var/lib/hermes"},
-                            ],
+                        "env": [
+                            {"name": "API_SERVER_ENABLED", "value": "true"},
+                            {"name": "HERMES_HOME", "value": "/var/lib/hermes"},
+                            {"name": "API_SERVER_KEY", "valueFrom": {"secretKeyRef": {"name": f"scilab-{lab_id}-hermes-api", "key": "api_key"}}},
+                        ],
                             "envFrom": secret_env,
                             "resources": spec["resources"],
                             "volumeMounts": [
@@ -148,6 +156,12 @@ def build_resources(
                                 {
                                     "name": "skills-runtime",
                                     "mountPath": "/var/lib/hermes/skills",
+                                    "readOnly": True,
+                                },
+                                {
+                                    "name": "hermes-config",
+                                    "mountPath": "/var/lib/hermes/config.yaml",
+                                    "subPath": "config.yaml",
                                     "readOnly": True,
                                 },
                             ],
@@ -159,6 +173,7 @@ def build_resources(
                             "persistentVolumeClaim": {"claimName": f"scilab-{lab_id}-hermes-home"},
                         },
                         {"name": "skills-runtime", "emptyDir": {}},
+                        {"name": "hermes-config", "configMap": {"name": hermes_config_name}},
                     ],
                 },
             },
@@ -188,7 +203,7 @@ def build_resources(
                 {
                     "from": [
                         {"podSelector": {"matchLabels": {"scilab.ai/component": "platform-gateway"}}},
-                        {"podSelector": {"matchLabels": {"scilab.ai/component": "run-service"}}},
+                    {"podSelector": {"matchLabels": {"scilab.ai/component": "run-service", "scilab.ai/lab-id": lab_id}}},
                         {
                             "podSelector": {
                                 "matchLabels": {
@@ -207,7 +222,95 @@ def build_resources(
             ],
         },
     }
-    return pvc, deployment, service, network_policy
+    return pvc, hermes_config, deployment, service, network_policy
+
+
+def build_run_worker(
+    lab_id: str,
+    namespace: str,
+    uid: str,
+    image: str,
+    database_secret: str,
+    nats_secret: str,
+    pi_provider: str,
+    reviewer_provider: str,
+    minio_secret: str,
+    resources: Mapping[str, Any],
+    release: str,
+    opa_secret: str = "scilab-opa",
+) -> dict[str, Any]:
+    if len(lab_id) > 40 or not DNS_LABEL.fullmatch(lab_id):
+        raise ValueError("labId must be a DNS label of at most 40 characters")
+    _require_string(namespace, "namespace")
+    _require_string(uid, "uid")
+    if not IMAGE_DIGEST.fullmatch(image):
+        raise ValueError("run worker image must be pinned by digest")
+    if not SECRET_NAME.fullmatch(database_secret):
+        raise ValueError("database secret name is invalid")
+    if not SECRET_NAME.fullmatch(nats_secret):
+        raise ValueError("NATS secret name is invalid")
+    if not SECRET_NAME.fullmatch(minio_secret):
+        raise ValueError("MinIO secret name is invalid")
+    if not SECRET_NAME.fullmatch(opa_secret):
+        raise ValueError("OPA secret name is invalid")
+    if not DNS_LABEL.fullmatch(release):
+        raise ValueError("release name must be a DNS label")
+    pi_provider = _require_string(pi_provider, "PI provider")
+    reviewer_provider = _require_string(reviewer_provider, "Reviewer provider")
+    if pi_provider == reviewer_provider:
+        raise ValueError("Reviewer provider must differ from PI provider")
+
+    labels = {
+        "app.kubernetes.io/name": "scilab-run-worker",
+        "app.kubernetes.io/instance": f"scilab-{lab_id}",
+        "app.kubernetes.io/managed-by": FIELD_MANAGER,
+        "scilab.ai/component": "run-service",
+        "scilab.ai/lab-id": lab_id,
+        "scilab.ai/platform-release": release,
+    }
+    name = f"scilab-{lab_id}-run-worker"
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": _metadata(name, namespace, uid, labels),
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 10001,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [{
+                        "name": "run-worker",
+                        "image": image,
+                        "command": ["python", "-m", "scilab.runs.worker_main"],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "resources": resources,
+                        "envFrom": [{"secretRef": {"name": minio_secret}}],
+                        "env": [
+                            {"name": "SCILAB_LAB_ID", "value": lab_id},
+                            {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+                            {"name": "SCILAB_DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": database_secret, "key": "SCILAB_DATABASE_URL"}}},
+                            {"name": "SCILAB_NATS_URL", "valueFrom": {"secretKeyRef": {"name": nats_secret, "key": "SCILAB_NATS_URL"}}},
+                            {"name": "SCILAB_PI_PROVIDER", "value": pi_provider},
+                            {"name": "SCILAB_REVIEWER_PROVIDER", "value": reviewer_provider},
+                            {"name": "SCILAB_HERMES_API_KEY", "valueFrom": {"secretKeyRef": {"name": f"scilab-{lab_id}-hermes-api", "key": "api_key"}}},
+                            {"name": "SCILAB_OPA_URL", "valueFrom": {"secretKeyRef": {"name": opa_secret, "key": "SCILAB_OPA_URL"}}},
+                        ],
+                    }],
+                },
+            },
+        },
+    }
 
 
 def apply_resources(
@@ -237,6 +340,8 @@ def apply_resources(
             apps_api.patch_namespaced_deployment(name, namespace, body, **kwargs)
         elif kind == "PersistentVolumeClaim":
             core_api.patch_namespaced_persistent_volume_claim(name, namespace, body, **kwargs)
+        elif kind == "ConfigMap":
+            core_api.patch_namespaced_config_map(name, namespace, body, **kwargs)
         elif kind == "Service":
             core_api.patch_namespaced_service(name, namespace, body, **kwargs)
         elif kind == "NetworkPolicy":

@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from scilab.identity import Identity
+from scilab.approvals import ApprovalStateError
+from scilab.api.hermes_approval import HermesApprovalUnavailable
 
 
 ROOT = Path(__file__).parents[4]
@@ -464,6 +466,24 @@ def test_ask_is_stateless_and_has_no_sandbox_dependency(api: tuple[Any, Any]) ->
         {"question": "What evidence?"},
         {"question": "Repeat?"},
     ]
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [(HermesApprovalUnavailable("secret-key"), 503), (ApprovalStateError("secret-key"), 409)],
+)
+def test_approval_delivery_errors_are_sanitized(api, error, status):
+    client, services = api
+
+    def fail(*args, **kwargs):
+        raise error
+
+    services.approvals.decide_approval = fail
+    response = client.post(
+        "/v1/runs/run-1/approvals/approval-1", json={"decision": "approve"}
+    )
+    assert response.status_code == status
+    assert "secret-key" not in response.text
 
 
 @pytest.mark.parametrize("period", ["daily", "monthly"])

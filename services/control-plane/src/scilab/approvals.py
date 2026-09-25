@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
+from scilab.events import EventFanoutError
 from scilab.identity import Identity
 from scilab.runs.model import Run, RunState
 from scilab.runs.service import RunNotFound, RunService
@@ -22,6 +24,7 @@ from scilab.tenancy import require_scope
 APPROVAL_EFFECTS = frozenset(
     {"read", "publish", "external_write", "delete", "credential_use", "network_change", "unknown"}
 )
+_LOG = logging.getLogger(__name__)
 _SENSITIVE_KEYS = frozenset(
     {"password", "passwd", "secret", "token", "api_key", "authorization", "credential"}
 )
@@ -174,7 +177,8 @@ class ApprovalService:
 
     @classmethod
     def _approval(cls, row: Mapping[str, Any] | tuple[Any, ...]) -> Approval:
-        values = dict(row) if isinstance(row, Mapping) else dict(zip(cls._approval_columns, row, strict=True))
+        values = ({column: row[column] for column in cls._approval_columns}
+                  if isinstance(row, Mapping) else dict(zip(cls._approval_columns, row[:len(cls._approval_columns)], strict=True)))
         if isinstance(values["preview"], (str, bytes, bytearray)):
             values["preview"] = json.loads(values["preview"])
         return Approval(**values)
@@ -366,6 +370,203 @@ class ApprovalService:
             )
         return approval
 
+    async def request_hermes_approval(
+        self, identity: Identity, run_id: str, hermes_request_id: str,
+        preview: Mapping[str, Any],
+    ) -> tuple[Approval, Run]:
+        request_id = _text(hermes_request_id, "hermes_request_id")
+        if len(request_id) > 256:
+            raise ValueError("hermes_request_id exceeds 256 characters")
+        if not isinstance(preview, Mapping):
+            raise ValueError("preview must be a mapping")
+        safe_preview = _redact(dict(preview))
+        policy = self.evaluate_action("hermes.tool", "unknown", safe_preview)
+        fingerprint = hashlib.sha256(
+            json.dumps([identity.lab_id, run_id, request_id], separators=(",", ":")).encode()
+        ).hexdigest()
+        now = self.clock()
+        created = False
+        with self._access(identity, "runs:write") as cursor:
+            run = self._load_run(cursor, identity, run_id)
+            cursor.execute(
+                f"SELECT {self._approval_select} FROM approvals "
+                "WHERE lab_id = %s AND run_id = %s AND hermes_request_id = %s "
+                "/* hermes_by_request */",
+                (identity.lab_id, run_id, request_id),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                return self._approval(row), run
+            if run.state is not RunState.RUNNING:
+                raise ApprovalStateError("Hermes approval requires a running Run")
+            updated = apply_transition(run, RunState.AWAITING_APPROVAL, now)
+            candidate = Approval(
+                self.id_factory(), run_id, identity.lab_id, "hermes.tool", "unknown",
+                fingerprint, "pending", policy.reason, policy.policy_rule, safe_preview,
+                now, now + timedelta(hours=24), None, None, None,
+            )
+            cursor.execute(
+                "INSERT INTO approvals (id, run_id, lab_id, action, effect, "
+                "action_fingerprint, status, reason, policy_rule, preview, requested_at, "
+                "expires_at, decided_at, actor, note, hermes_request_id) "
+                "VALUES (" + ", ".join(["%s"] * 16) + ") ON CONFLICT DO NOTHING",
+                (candidate.id, candidate.run_id, candidate.lab_id, candidate.action,
+                 candidate.effect, candidate.action_fingerprint, candidate.status,
+                 candidate.reason, candidate.policy_rule, json.dumps(candidate.preview),
+                 candidate.requested_at, candidate.expires_at, None, None, None, request_id),
+            )
+            self._save_run(cursor, updated)
+            approval = candidate
+            created = True
+        if created:
+            await self.event_service.publish_event(
+                identity, run_id, "approval.required", approval.event_payload(), "policy"
+            )
+            await self.event_service.publish_event(
+                identity, run_id, "run.state",
+                {"from": "running", "to": "awaiting_approval", "reason": "approval_required"},
+                "run-service",
+            )
+        return approval, updated
+
+    def _hermes_record(self, cursor: Any, identity: Identity, approval_id: str, run_id: str) -> Mapping[str, Any]:
+        cursor.execute(
+            f"SELECT {self._approval_select}, hermes_request_id, hermes_decision, "
+            "hermes_decision_actor, hermes_decided_at, hermes_decision_note FROM approvals "
+            "WHERE lab_id = %s AND id = %s AND run_id = %s FOR UPDATE /* hermes_by_id */",
+            (identity.lab_id, approval_id, _text(run_id, "run_id")),
+        )
+        row = cursor.fetchone()
+        if row is not None and not isinstance(row, Mapping):
+            row = dict(zip(
+                (*self._approval_columns, "hermes_request_id", "hermes_decision",
+                 "hermes_decision_actor", "hermes_decided_at", "hermes_decision_note"),
+                row, strict=True,
+            ))
+        if row is None or row["hermes_request_id"] is None:
+            raise ApprovalNotFound("Hermes approval not found")
+        return row
+
+    def hermes_request_id(self, identity: Identity, approval_id: str, run_id: str) -> str | None:
+        with self._access(identity, "runs:approve") as cursor:
+            cursor.execute(
+                "SELECT hermes_request_id FROM approvals WHERE lab_id = %s AND id = %s "
+                "AND run_id = %s /* hermes_id_lookup */",
+                (identity.lab_id, approval_id, _text(run_id, "run_id")),
+            )
+            row = cursor.fetchone()
+            return None if row is None else (row["hermes_request_id"] if isinstance(row, Mapping) else row[0])
+
+    def hermes_run_id(self, identity: Identity, approval_id: str, run_id: str) -> str:
+        with self._access(identity, "runs:approve") as cursor:
+            self._hermes_record(cursor, identity, approval_id, run_id)
+            vendor_id = self._load_run(cursor, identity, run_id).hermes_run_id
+            if not vendor_id:
+                raise ApprovalStateError("Hermes Run ID unavailable")
+            return vendor_id
+
+    def stage_hermes_decision(
+        self, identity: Identity, approval_id: str, decision: str,
+        *, note: str | None = None, run_id: str,
+    ) -> str:
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        now = self.clock()
+        with self._access(identity, "runs:approve") as cursor:
+            row = self._hermes_record(cursor, identity, approval_id, run_id)
+            approval = self._approval(row)
+            if approval.status != "pending" or now >= approval.expires_at:
+                raise ApprovalStateError("approval is not pending")
+            run = self._load_run(cursor, identity, run_id)
+            if run.state is not RunState.AWAITING_APPROVAL:
+                raise ApprovalStateError("Run is not awaiting approval")
+            if row["hermes_decision"] is not None:
+                if row["hermes_decision"] != decision:
+                    raise ApprovalStateError("conflicting Hermes decision")
+                return row["hermes_request_id"]
+            cursor.execute(
+                "UPDATE approvals SET hermes_decision = %s, hermes_decision_actor = %s, "
+                "hermes_decided_at = %s, hermes_decision_note = %s "
+                "WHERE lab_id = %s AND id = %s /* hermes_stage */",
+                (decision, identity.principal, now, note, identity.lab_id, approval_id),
+            )
+            return row["hermes_request_id"]
+
+    async def confirm_hermes_decision(
+        self, identity: Identity, approval_id: str, *, run_id: str,
+    ) -> Approval:
+        with self._access(identity, "runs:approve") as cursor:
+            row = self._hermes_record(cursor, identity, approval_id, run_id)
+            approval = self._approval(row)
+            if approval.status in {"approved", "rejected"}:
+                return approval
+            if approval.status != "pending" or row["hermes_decision"] is None:
+                raise ApprovalStateError("Hermes decision was not staged")
+            now = self.clock()
+            if now >= approval.expires_at:
+                raise ApprovalStateError("approval expired")
+            run = self._load_run(cursor, identity, run_id)
+            if run.state is not RunState.AWAITING_APPROVAL:
+                raise ApprovalStateError("Run is not awaiting approval")
+            approved = row["hermes_decision"] == "approve"
+            status = "approved" if approved else "rejected"
+            updated = apply_transition(
+                run, RunState.RUNNING if approved else RunState.CANCELLED,
+                now, reason=None if approved else "approval_rejected",
+            )
+            cursor.execute(
+                "UPDATE approvals SET status = %s, decided_at = %s, actor = %s, note = %s "
+                "WHERE lab_id = %s AND id = %s",
+                (status, row["hermes_decided_at"], row["hermes_decision_actor"],
+                 row["hermes_decision_note"], identity.lab_id, approval_id),
+            )
+            self._save_run(cursor, updated)
+            event = self.event_service.record_with_cursor(
+                cursor,
+                identity,
+                run_id,
+                "run.state",
+                {
+                    "from": run.state.value,
+                    "to": updated.state.value,
+                    "reason": updated.reason or "approval_approved",
+                },
+                "run-service",
+            )
+            confirmed = Approval(
+                **{
+                    **approval.__dict__,
+                    "status": status,
+                    "decided_at": row["hermes_decided_at"],
+                    "actor": row["hermes_decision_actor"],
+                    "note": row["hermes_decision_note"],
+                }
+            )
+        try:
+            await self.event_service.fanout_recorded(event)
+        except EventFanoutError:
+            _LOG.warning("Hermes approval confirmed; persisted run-state event fanout failed")
+        return confirmed
+
+    def final_hermes_approval(
+        self,
+        identity: Identity,
+        approval_id: str,
+        decision: str,
+        *,
+        run_id: str,
+    ) -> Approval | None:
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        with self._access(identity, "runs:approve") as cursor:
+            row = self._hermes_record(cursor, identity, approval_id, run_id)
+            approval = self._approval(row)
+            if approval.status not in {"approved", "rejected"}:
+                return None
+            if row["hermes_decision"] != decision:
+                raise ApprovalStateError("conflicting Hermes decision")
+            return approval
+
     def consume_approval(self, identity: Identity, approval_id: str) -> Approval:
         now = self.clock()
         with self._access(identity, "runs:write") as cursor:
@@ -419,7 +620,7 @@ class ApprovalService:
                 else (identity.lab_id, approval_id)
             )
             cursor.execute(
-                f"SELECT {self._approval_select} FROM approvals "
+                f"SELECT {self._approval_select}, hermes_request_id FROM approvals "
                 f"WHERE lab_id = %s AND id = %s{run_filter} "
                 "FOR UPDATE /* approval_by_id */",
                 params,
@@ -428,6 +629,8 @@ class ApprovalService:
             if row is None:
                 raise ApprovalNotFound("approval not found")
             approval = self._approval(row)
+            if (row.get("hermes_request_id") if isinstance(row, Mapping) else row[-1]) is not None:
+                raise ApprovalStateError("Hermes approval requires staged vendor confirmation")
             if approval.status != "pending":
                 raise ApprovalStateError("approval already decided")
             if now >= approval.expires_at:

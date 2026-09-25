@@ -4,6 +4,7 @@ import asyncio
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +46,7 @@ class Cursor:
     def __init__(self, database: "Database") -> None:
         self.database = database
         self.result: list[dict[str, object]] = []
+        self.hermes_select: str | None = None
 
     def __enter__(self) -> "Cursor":
         return self
@@ -54,6 +56,7 @@ class Cursor:
 
     def execute(self, sql: str, params: tuple[object, ...]) -> None:
         compact = " ".join(sql.split()).lower()
+        self.hermes_select = None
         if compact.startswith("select set_config"):
             self.database.current_lab_id = str(params[1])
             return
@@ -64,6 +67,12 @@ class Cursor:
             return
         if compact.startswith("insert into approvals"):
             row = dict(zip(APPROVAL_COLUMNS, params))
+            if len(params) == 16:
+                row["hermes_request_id"] = params[-1]
+                row["hermes_decision"] = None
+                row["hermes_decision_actor"] = None
+                row["hermes_decided_at"] = None
+                row["hermes_decision_note"] = None
             existing = next(
                 (
                     item
@@ -89,6 +98,19 @@ class Cursor:
                 and row["status"] in {"pending", "approved"}
             ]
             return
+        if "/* hermes_by_request */" in compact:
+            lab_id, run_id, request_id = params
+            self.result = [row for row in self.database.approvals
+                           if row["lab_id"] == lab_id and row["run_id"] == run_id
+                           and row.get("hermes_request_id") == request_id]
+            return
+        if "/* hermes_by_id */" in compact or "/* hermes_id_lookup */" in compact:
+            self.hermes_select = "id" if "/* hermes_by_id */" in compact else "lookup"
+            lab_id, approval_id, run_id = params
+            self.result = [row for row in self.database.approvals
+                           if row["lab_id"] == lab_id and row["id"] == approval_id
+                           and row["run_id"] == run_id]
+            return
         if "/* approval_by_id */" in compact:
             lab_id, approval_id, *run_id = params
             self.result = [
@@ -110,6 +132,13 @@ class Cursor:
             ]
             return
         if compact.startswith("update approvals"):
+            if "/* hermes_stage */" in compact:
+                decision, actor, decided_at, note, lab_id, approval_id = params
+                row = next(row for row in self.database.approvals
+                           if row["lab_id"] == lab_id and row["id"] == approval_id)
+                row.update(hermes_decision=decision, hermes_decision_actor=actor,
+                           hermes_decided_at=decided_at, hermes_decision_note=note)
+                return
             status, decided_at, actor, note, lab_id, approval_id = params
             row = next(
                 item
@@ -133,7 +162,16 @@ class Cursor:
         raise AssertionError(f"unexpected SQL: {compact}")
 
     def fetchone(self) -> dict[str, object] | None:
-        return self.result[0] if self.result else None
+        if not self.result:
+            return None
+        row = self.result[0]
+        if self.database.tuple_rows and self.hermes_select == "id":
+            return tuple(row.get(column) for column in (*APPROVAL_COLUMNS, "hermes_request_id",
+                          "hermes_decision", "hermes_decision_actor", "hermes_decided_at",
+                          "hermes_decision_note"))
+        if self.database.tuple_rows and self.hermes_select == "lookup":
+            return (row.get("hermes_request_id"),)
+        return row
 
     def fetchall(self) -> list[dict[str, object]]:
         return list(self.result)
@@ -144,6 +182,7 @@ class Database:
         self.runs: dict[tuple[str, str], dict[str, object]] = {}
         self.approvals: list[dict[str, object]] = []
         self.current_lab_id: str | None = None
+        self.tuple_rows = False
 
     def transaction(self):
         return nullcontext()
@@ -197,6 +236,8 @@ class OPA:
 class Events:
     def __init__(self) -> None:
         self.published: list[tuple[Identity, str, str, dict[str, object], str]] = []
+        self.recorded: list[SimpleNamespace] = []
+        self.fanned_out: list[SimpleNamespace] = []
 
     async def publish_event(
         self,
@@ -207,6 +248,29 @@ class Events:
         source: str,
     ) -> None:
         self.published.append((actor, run_id, event_type, payload, source))
+
+    def record_with_cursor(
+        self,
+        cursor: object,
+        actor: Identity,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        source: str,
+    ) -> SimpleNamespace:
+        event = SimpleNamespace(
+            event_id="approval-event",
+            lab_id=actor.lab_id,
+            run_id=run_id,
+            type=event_type,
+            payload=payload,
+            source=source,
+        )
+        self.recorded.append(event)
+        return event
+
+    async def fanout_recorded(self, event: SimpleNamespace) -> None:
+        self.fanned_out.append(event)
 
 
 def service(database: Database, opa: OPA | None = None, events: Events | None = None):
@@ -526,3 +590,137 @@ def test_policy_and_migration_are_fail_safe_tenant_scoped_and_additive() -> None
     assert "enable row level security" in migration
     assert "force row level security" in migration
     assert "current_setting('scilab.current_lab_id', true)" in migration
+
+
+def test_hermes_request_stage_retry_and_confirm() -> None:
+    from scilab.approvals import ApprovalNotFound, ApprovalStateError
+
+    database = Database()
+    database.add_running_run()
+    events = Events()
+    approval_service = service(database, events=events)
+    approval, awaiting = asyncio.run(approval_service.request_hermes_approval(
+        identity(), "run-1", "req-1", {"command": "redacted", "api_key": "secret"}
+    ))
+    again, _ = asyncio.run(approval_service.request_hermes_approval(
+        identity(), "run-1", "req-1", {"command": "redacted"}
+    ))
+    assert again.id == approval.id
+    assert awaiting.state is RunState.AWAITING_APPROVAL
+    assert awaiting.runtime_used == timedelta(0)
+    assert approval.preview["api_key"] == "[REDACTED]"
+    assert [event[2] for event in events.published] == ["approval.required", "run.state"]
+    assert events.published[1][3] == {
+        "from": "running", "to": "awaiting_approval", "reason": "approval_required"
+    }
+    assert approval_service.hermes_request_id(identity("lab-a", "runs:approve"), approval.id, "run-1") == "req-1"
+    assert approval_service.hermes_run_id(identity("lab-a", "runs:approve"), approval.id, "run-1") == "hermes-1"
+    approver = identity("lab-a", "runs:approve")
+    assert approval_service.stage_hermes_decision(
+        approver, approval.id, "approve", note="reviewed", run_id="run-1"
+    ) == "req-1"
+    assert database.runs[("lab-a", "run-1")]["state"] == "awaiting_approval"
+    retrying_actor = Identity("lab-a", "user:second", frozenset({"runs:approve"}))
+    assert approval_service.stage_hermes_decision(
+        retrying_actor, approval.id, "approve", note="retry", run_id="run-1"
+    ) == "req-1"
+    with pytest.raises(ApprovalStateError):
+        approval_service.stage_hermes_decision(approver, approval.id, "reject", run_id="run-1")
+    assert approval_service.final_hermes_approval(
+        approver, approval.id, "approve", run_id="run-1"
+    ) is None
+    confirmed = asyncio.run(
+        approval_service.confirm_hermes_decision(retrying_actor, approval.id, run_id="run-1")
+    )
+    assert confirmed.status == "approved"
+    assert confirmed.note == "reviewed"
+    assert confirmed.actor == approver.principal
+    assert confirmed.decided_at == NOW
+    assert database.runs[("lab-a", "run-1")]["state"] == "running"
+    assert asyncio.run(
+        approval_service.confirm_hermes_decision(approver, approval.id, run_id="run-1")
+    ) == confirmed
+    assert approval_service.final_hermes_approval(
+        retrying_actor, approval.id, "approve", run_id="run-1"
+    ) == confirmed
+    with pytest.raises(ApprovalStateError):
+        approval_service.final_hermes_approval(
+            retrying_actor, approval.id, "reject", run_id="run-1"
+        )
+    with pytest.raises(ApprovalNotFound):
+        approval_service.final_hermes_approval(
+            identity("lab-b", "runs:approve"), approval.id, "approve", run_id="run-1"
+        )
+    with pytest.raises(ApprovalNotFound):
+        approval_service.final_hermes_approval(
+            retrying_actor, approval.id, "approve", run_id="other-run"
+        )
+    assert [event.type for event in events.fanned_out] == ["run.state"]
+    assert events.recorded == events.fanned_out
+    assert events.recorded[0].payload == {
+        "from": "awaiting_approval", "to": "running", "reason": "approval_approved"
+    }
+
+
+def test_hermes_reject_is_bound_and_cannot_use_platform_decision_path() -> None:
+    from scilab.approvals import ApprovalNotFound, ApprovalStateError
+
+    database = Database()
+    database.add_running_run()
+    approval_service = service(database)
+    approval, _ = asyncio.run(approval_service.request_hermes_approval(
+        identity(), "run-1", "req-1", {"token": "sensitive"}
+    ))
+    approver = identity("lab-a", "runs:approve")
+    assert approval_service.hermes_request_id(
+        identity("lab-b", "runs:approve"), approval.id, "run-1"
+    ) is None
+    with pytest.raises(ApprovalNotFound):
+        approval_service.stage_hermes_decision(approver, approval.id, "reject", run_id="other")
+    with pytest.raises(ApprovalStateError):
+        approval_service.decide_approval(approver, approval.id, "approve", run_id="run-1")
+    approval_service.stage_hermes_decision(approver, approval.id, "reject", run_id="run-1")
+    assert database.runs[("lab-a", "run-1")]["state"] == "awaiting_approval"
+    rejected = asyncio.run(
+        approval_service.confirm_hermes_decision(approver, approval.id, run_id="run-1")
+    )
+    assert rejected.status == "rejected"
+    assert database.runs[("lab-a", "run-1")]["reason"] == "approval_rejected"
+
+
+def test_hermes_request_id_validation_and_24_hour_boundary() -> None:
+    from scilab.approvals import ApprovalStateError
+
+    database = Database()
+    database.add_running_run()
+    approval_service = service(database)
+    for request_id in ("", " " * 2, "x" * 257):
+        with pytest.raises(ValueError):
+            asyncio.run(approval_service.request_hermes_approval(identity(), "run-1", request_id, {}))
+    approval, _ = asyncio.run(approval_service.request_hermes_approval(identity(), "run-1", "req-1", {}))
+    assert approval.expires_at == NOW + timedelta(hours=24)
+    expired = approval_service.expire_approvals(identity(), now=approval.expires_at)
+    assert [item.status for item in expired] == ["expired"]
+    assert database.runs[("lab-a", "run-1")]["runtime_used"] == timedelta(0)
+    with pytest.raises(ApprovalStateError):
+        approval_service.stage_hermes_decision(
+            identity("lab-a", "runs:approve"), approval.id, "approve", run_id="run-1"
+        )
+
+
+def test_hermes_decision_supports_tuple_database_rows() -> None:
+    database = Database()
+    database.tuple_rows = True
+    database.add_running_run()
+    approval_service = service(database)
+    approval, _ = asyncio.run(approval_service.request_hermes_approval(
+        identity(), "run-1", "req-1", {}
+    ))
+    approver = identity("lab-a", "runs:approve")
+    assert approval_service.hermes_request_id(approver, approval.id, "run-1") == "req-1"
+    assert approval_service.stage_hermes_decision(
+        approver, approval.id, "approve", run_id="run-1"
+    ) == "req-1"
+    assert asyncio.run(
+        approval_service.confirm_hermes_decision(approver, approval.id, run_id="run-1")
+    ).status == "approved"

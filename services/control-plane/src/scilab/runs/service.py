@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -15,6 +16,10 @@ from scilab.tenancy import require_scope
 
 class RunNotFound(LookupError):
     """Raised for both missing and cross-Lab run identifiers."""
+
+
+class RunIdempotencyConflict(ValueError):
+    """Raised when a Lab reuses a Run key with a different request payload."""
 
 
 class RunService:
@@ -38,6 +43,7 @@ class RunService:
         "budget_thb",
     )
     _select = ", ".join(_columns)
+    _search_columns = _columns + ("request_payload", "actor")
 
     def __init__(self, connection: Any, *, clock: Callable[[], datetime] = utc_now) -> None:
         self.connection = connection
@@ -69,9 +75,30 @@ class RunService:
         max_minutes: int = 120,
         context_id: str | None = None,
         budget_thb: float | None = None,
+        request_payload: Mapping[str, Any] | None = None,
+        actor: str | None = None,
     ) -> Run:
         self._require_key(idempotency_key)
         budget_thb = _normalize_budget_thb(budget_thb)
+        request_json: str | None = None
+        if request_payload is not None:
+            if not isinstance(request_payload, Mapping):
+                raise ValueError("request_payload must be a mapping")
+            if not isinstance(actor, str) or not actor.strip():
+                raise ValueError("actor must be non-blank with request_payload")
+            try:
+                request_json = json.dumps(
+                    dict(request_payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("request_payload must contain JSON values") from exc
+        if actor is not None and actor != identity.principal:
+            raise ValueError("actor must match authenticated principal")
+        actor = identity.principal
         if context_id is not None and (
             not isinstance(context_id, str) or not context_id.strip()
         ):
@@ -90,6 +117,7 @@ class RunService:
                     approval_expires_at, context_id, budget_thb
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (lab_id, idempotency_key) DO NOTHING
+                RETURNING id
                 """,
                 (
                     run_id,
@@ -111,6 +139,15 @@ class RunService:
                     budget_thb,
                 ),
             )
+            inserted = cursor.fetchone() is not None
+            if inserted:
+                cursor.execute(
+                    "UPDATE runs SET request_payload = %s::jsonb, actor = %s "
+                    "WHERE lab_id = %s AND id = %s RETURNING id",
+                    (request_json, actor, identity.lab_id, run_id),
+                )
+                if cursor.fetchone() is None:
+                    raise RunNotFound("run not found")
             cursor.execute(
                 f"SELECT {self._select} FROM runs "
                 "WHERE lab_id = %s AND idempotency_key = %s",
@@ -119,6 +156,38 @@ class RunService:
             row = cursor.fetchone()
             if row is None:
                 raise RunNotFound("run not found")
+            if not inserted:
+                run = self._from_row(row)
+                cursor.execute(
+                    "SELECT request_payload, actor FROM runs "
+                    "WHERE lab_id = %s AND id = %s",
+                    (identity.lab_id, run.id),
+                )
+                stored_row = cursor.fetchone()
+                stored_payload = (
+                    stored_row.get("request_payload")
+                    if isinstance(stored_row, Mapping)
+                    else stored_row[0] if stored_row is not None else None
+                )
+                stored_actor = (
+                    stored_row.get("actor")
+                    if isinstance(stored_row, Mapping)
+                    else stored_row[1] if stored_row is not None else None
+                )
+                try:
+                    same_request = stored_payload is not None and json.dumps(
+                        stored_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ) == request_json
+                except (TypeError, ValueError):
+                    same_request = False
+                if (request_json is not None and not same_request) or stored_actor != actor:
+                    raise RunIdempotencyConflict(
+                        "idempotency key already has a different request payload"
+                    )
             return self._from_row(row)
 
     def _mutate(
@@ -227,7 +296,12 @@ class RunService:
         return self.transition(identity, run_id, RunState.CANCELLED, reason="stopped")
 
     def retry(self, identity: Identity, run_id: str) -> Run:
-        return self._mutate(identity, run_id, apply_retry)
+        def retry_supported(run: Run, now: datetime) -> Run:
+            if run.reason == "unsupported_stored_options":
+                raise RunStateError("Run with unsupported stored options cannot be retried")
+            return apply_retry(run, now)
+
+        return self._mutate(identity, run_id, retry_supported)
 
     def get(self, identity: Identity, run_id: str) -> Run:
         with self._access(identity, "runs:read") as cursor:
@@ -248,3 +322,45 @@ class RunService:
                 (identity.lab_id,),
             )
             return [self._from_row(row) for row in cursor.fetchall()]
+
+    def search_submissions(
+        self,
+        identity: Identity,
+        *,
+        state: str | None = None,
+        actor: str | None = None,
+        since: datetime | None = None,
+        after: tuple[datetime, str] | None = None,
+        limit: int = 101,
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        filters = ["lab_id = %s"]
+        params: list[Any] = [identity.lab_id]
+        if state is not None:
+            filters.append("state = %s")
+            params.append(state)
+        if actor is not None:
+            filters.append("actor = %s")
+            params.append(actor)
+        if since is not None:
+            filters.append("created_at >= %s")
+            params.append(since)
+        if after is not None:
+            filters.append("(created_at, id) < (%s, %s)")
+            params.extend(after)
+        params.append(limit)
+        with self._access(identity, "runs:read") as cursor:
+            cursor.execute(
+                f"SELECT {', '.join(self._search_columns)} FROM runs WHERE "
+                + " AND ".join(filters)
+                + " ORDER BY created_at DESC, id DESC LIMIT %s",
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+            return [
+                dict(row)
+                if isinstance(row, Mapping)
+                else dict(zip(self._search_columns, row, strict=True))
+                for row in rows
+            ]

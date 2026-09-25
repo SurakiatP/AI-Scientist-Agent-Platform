@@ -1,0 +1,68 @@
+images:
+  api:
+    repository: ""
+    digest: ""
+  web:
+    repository: ""
+    digest: ""
+  # Image for Operator-managed, per-Lab identity-scoped worker Deployments.
+  # Helm does not render a shared worker Deployment.
+  runWorker:
+    repository: ""
+    digest: ""
+  labOperator:
+    repository: ""
+    digest: ""
+  openSandbox:
+    execd:
+      digest: ""
+    egress:
+      digest: ""
+
+externalSecrets:
+  # Names of pre-provisioned Secrets in the release namespace; the chart never
+  # stores Secret values. Required application keys are mapped explicitly:
+  # postgres: SCILAB_DATABASE_URL
+  # keycloak: SCILAB_OIDC_ISSUER, SCILAB_OIDC_AUDIENCE, SCILAB_OIDC_JWKS_URI
+  # minio: SCILAB_MINIO_URL, SCILAB_MINIO_ACCESS_KEY, SCILAB_MINIO_SECRET_KEY,
+  #        SCILAB_INPUT_BUCKET, SCILAB_ARTIFACT_BUCKET
+  # nats: SCILAB_NATS_URL; opa: SCILAB_OPA_URL
+  # telemetry is passed through for deployment-provided telemetry settings.
+  # The Operator receives PostgreSQL and NATS Secret names only; its worker
+  # builder must use secretKeyRefs for SCILAB_DATABASE_URL and SCILAB_NATS_URL.
+  postgres: ""
+  minio: ""
+  nats: ""
+  keycloak: ""
+  opa: ""
+  telemetry: ""
+
+api:
+  replicas: 1
+  port: 8000
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    tlsSecretName: ""
+
+labOperator:
+  replicas: 1
+web:
+  replicas: 1
+  port: 3000
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    tlsSecretName: ""
+network:
+  # Include actual DNS, Kubernetes API and external dependency routes.
+  # Empty fails rendering; never use guessed or blanket CIDRs.
+  externalCidrs: []
+runWorker:
+  # Required explicit provider identifiers; there are intentionally no defaults.
+  piProvider: ""
+  reviewerProvider: ""
+
+# Run workers remain out of this chart until per-Lab identity-scoped reconciliation is defined.

@@ -6,11 +6,11 @@
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
-    "start": "next start --hostname 127.0.0.1",
+    "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test:oidc": "SCILAB_OIDC_E2E=1 playwright test",
-    "test": "node --test demo/server.test.mjs tests/auth.test.mjs && playwright test",
+    "test": "node --test demo/server.test.mjs tests/auth.test.mjs tests/container-start.test.mjs tests/runtime-proxy.test.mjs && playwright test",
     "demo": "node demo/run.mjs"
   },
   "dependencies": {

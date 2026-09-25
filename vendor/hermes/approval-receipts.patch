@@ -1,0 +1,1389 @@
+diff --git a/gateway/platforms/api_server_run_idempotency.py b/gateway/platforms/api_server_run_idempotency.py
+index 0820896..129db94 100644
+--- a/gateway/platforms/api_server_run_idempotency.py
++++ b/gateway/platforms/api_server_run_idempotency.py
+@@ -106,6 +106,19 @@ class RunIdempotencyStore:
+                 add_column_if_missing(self._conn, "run_idempotency", column, f"{column} {ddl}")
+         self._conn.execute(
+             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
++        self._conn.execute(
++            """CREATE TABLE IF NOT EXISTS approval_receipts (
++                scope TEXT NOT NULL,
++                run_id TEXT NOT NULL,
++                request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 256),
++                choice TEXT NOT NULL CHECK(choice IN ('once', 'deny')),
++                state TEXT NOT NULL CHECK(state IN ('prepared', 'committed')),
++                resolved INTEGER NOT NULL DEFAULT 0 CHECK(resolved IN (0, 1)),
++                created_at REAL NOT NULL,
++                updated_at REAL NOT NULL,
++                PRIMARY KEY (scope, run_id, request_id)
++            )"""
++        )
+         self._conn.commit()
+         self._lock = threading.Lock()
+         self._tighten_permissions()
+@@ -170,19 +183,30 @@ class RunIdempotencyStore:
+         """Prune aged replay records only once their stored run is terminal (caller holds the
+         lock + transaction): a long or disconnected room turn may outlive the retention window."""
+         stale = self._conn.execute(
+-            """SELECT scope, idempotency_key, status_json
++            """SELECT scope, idempotency_key, run_id, status_json
+                  FROM run_idempotency
+                 WHERE acknowledged_at <= ?
+                    OR (retention_until > 0 AND retention_until <= ?)
+                    OR (retention_until <= 0 AND updated_at < ?)""",
+             (now - self.ACKNOWLEDGED_RETENTION_SECONDS, now, now - self.RETENTION_SECONDS),
+         ).fetchall()
+-        for stale_scope, stale_key, stale_status in stale:
++        for stale_scope, stale_key, stale_run_id, stale_status in stale:
+             try:
+                 terminal = json.loads(stale_status).get("status") in TERMINAL_STATUSES
+             except Exception:
+                 terminal = False
+             if terminal:
++                fresh_receipt = self._conn.execute(
++                    "SELECT 1 FROM approval_receipts WHERE scope=? AND run_id=? "
++                    "AND updated_at > ? LIMIT 1",
++                    (stale_scope, stale_run_id, now - self.RETENTION_SECONDS),
++                ).fetchone()
++                if fresh_receipt:
++                    continue
++                self._conn.execute(
++                    "DELETE FROM approval_receipts WHERE scope=? AND run_id=?",
++                    (stale_scope, stale_run_id),
++                )
+                 self._conn.execute(
+                     "DELETE FROM run_idempotency WHERE scope=? AND idempotency_key=?", (stale_scope, stale_key))
+ 
+@@ -224,6 +248,83 @@ class RunIdempotencyStore:
+                 (_encode_status(status), time.time(), run_id))
+             self._conn.commit()
+ 
++    def _require_durable_receipts(self) -> None:
++        if not self.durable:
++            raise RuntimeError("approval receipts require durable SQLite storage")
++
++    @staticmethod
++    def _validate_approval_receipt(scope: str, run_id: str, request_id: str, choice: str) -> None:
++        if not all(isinstance(value, str) and value.strip() for value in (scope, run_id, request_id)):
++            raise ValueError("approval receipt scope, run, and request ID must be nonblank")
++        if len(request_id) > 256:
++            raise ValueError("approval request ID exceeds 256 characters")
++        if choice not in {"once", "deny"}:
++            raise ValueError("approval receipt choice must be once or deny")
++
++    def prepare_approval_receipt(
++        self, scope: str, run_id: str, request_id: str, choice: str
++    ) -> dict[str, Any]:
++        """Durably reserve an exact decision before waking its approval waiter."""
++        self._require_durable_receipts()
++        self._validate_approval_receipt(scope, run_id, request_id, choice)
++        now = time.time()
++        with self._immediate_txn():
++            existing = self._conn.execute(
++                "SELECT 1 FROM approval_receipts WHERE scope=? AND run_id=? AND request_id=?",
++                (scope, run_id, request_id),
++            ).fetchone()
++            if existing is not None:
++                raise ValueError("approval receipt already exists")
++            self._conn.execute(
++                "INSERT INTO approval_receipts"
++                "(scope,run_id,request_id,choice,state,resolved,created_at,updated_at) "
++                "VALUES(?,?,?,?, 'prepared', 0, ?, ?)",
++                (scope, run_id, request_id, choice, now, now),
++            )
++            self._conn.commit()
++        return self.get_approval_receipt(scope, run_id, request_id)
++
++    def commit_approval_receipt(
++        self, scope: str, run_id: str, request_id: str
++    ) -> dict[str, Any]:
++        """Commit only a prepared receipt after waiter release and durable Run status."""
++        self._require_durable_receipts()
++        self._validate_approval_receipt(scope, run_id, request_id, "once")
++        with self._immediate_txn():
++            changed = self._conn.execute(
++                "UPDATE approval_receipts SET state='committed', resolved=1, updated_at=? "
++                "WHERE scope=? AND run_id=? AND request_id=? AND state='prepared' AND resolved=0",
++                (time.time(), scope, run_id, request_id),
++            ).rowcount
++            if changed != 1:
++                raise ValueError("approval receipt is not prepared")
++            self._conn.commit()
++        return self.get_approval_receipt(scope, run_id, request_id)
++
++    def get_approval_receipt(
++        self, scope: str, run_id: str, request_id: str
++    ) -> dict[str, Any] | None:
++        """Read one exact durable receipt without exposing unrelated Run data."""
++        self._require_durable_receipts()
++        self._validate_approval_receipt(scope, run_id, request_id, "once")
++        with self._lock:
++            row = self._conn.execute(
++                "SELECT choice,state,resolved,created_at,updated_at FROM approval_receipts "
++                "WHERE scope=? AND run_id=? AND request_id=?",
++                (scope, run_id, request_id),
++            ).fetchone()
++        if row is None:
++            return None
++        return {
++            "run_id": run_id,
++            "request_id": request_id,
++            "choice": row[0],
++            "state": row[1],
++            "resolved": int(row[2]),
++            "created_at": float(row[3]),
++            "timestamp": float(row[4]),
++        }
++
+     def close(self) -> None:
+         with self._lock:
+             self._conn.close()
+diff --git a/gateway/platforms/api_server_runs.py b/gateway/platforms/api_server_runs.py
+index f018926..dd9df75 100644
+--- a/gateway/platforms/api_server_runs.py
++++ b/gateway/platforms/api_server_runs.py
+@@ -186,6 +186,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
+ def _http_routes(self) -> list[tuple[str, str, Any]]:
+     return [
+         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
++        ("GET", "/v1/runs/{run_id}/approvals/{request_id}",
++         lambda request, *, _api_server: _handle_get_run_approval_receipt(
++             self, request, _api_server=_api_server)),
+         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+@@ -1012,6 +1015,55 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
+     return err or web.json_response(status)
+ 
+ 
++async def _handle_get_run_approval_receipt(self, request: "web.Request", *, _api_server) -> "web.Response":
++    """Read only a committed approval receipt for this authenticated Run owner."""
++    run_id, _, _, _, err = _load_owned_run(
++        self, request, _api_server=_api_server, permission="status", active_fallback=False
++    )
++    if err is not None:
++        return err
++    request_id = request.match_info.get("request_id", "")
++    if not request_id.strip() or len(request_id) > 256:
++        return _json_error(
++            _api_server._openai_error,
++            "Approval request_id invalid.",
++            code="invalid_approval_request",
++            status=400,
++        )
++    scope = self._run_idempotency_scope(request)
++    try:
++        receipt = self._run_idempotency_store.get_approval_receipt(scope, run_id, request_id)
++    except Exception:
++        logger.exception("[api_server] approval receipt lookup unavailable")
++        return _json_error(
++            _api_server._openai_error,
++            "Approval receipt storage is unavailable.",
++            code="approval_receipt_unavailable",
++            status=503,
++        )
++    if receipt is None:
++        return _json_error(
++            _api_server._openai_error,
++            "Approval receipt not found.",
++            code="approval_receipt_not_found",
++            status=404,
++        )
++    if receipt["state"] != "committed" or receipt["resolved"] != 1:
++        return _json_error(
++            _api_server._openai_error,
++            "Approval receipt is not committed.",
++            code="approval_receipt_uncommitted",
++            status=409,
++        )
++    return web.json_response({
++        "object": "hermes.run.approval_response",
++        "run_id": run_id,
++        "request_id": request_id,
++        "choice": receipt["choice"],
++        "resolved": 1,
++    })
++
++
+ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
+     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
+     auth_err = self._check_auth(request)
+@@ -1065,9 +1117,6 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
+             q.put_nowait(_run_event(run_id, name, **fields))
+ 
+ 
+-_APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
+-
+-
+ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
+     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
+     _openai_error = _api_server._openai_error
+@@ -1079,44 +1128,134 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) ->
+         body = await request.json()
+     except Exception:
+         return _json_error(_openai_error, "Invalid JSON", status=400)
+-    raw_choice = str(body.get("choice", "")).strip().lower()
+-    choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
+-    room_scoped = bool(self._room_grant_token(request))
++    if not isinstance(body, dict) or set(body) != {"choice", "request_id"}:
++        return _json_error(
++            _openai_error,
++            "Approval requires exactly choice and request_id.",
++            code="invalid_approval_scope",
++            status=400,
++        )
++    raw_choice = body.get("choice")
++    choice = raw_choice if isinstance(raw_choice, str) else ""
+     raw_request_id = body.get("request_id")
+-    request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
+-    # Room grants may resolve exactly one request and never widen to session/always.
+-    allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
+-    resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
++    request_id = raw_request_id if isinstance(raw_request_id, str) else ""
++    allowed = {"once", "deny"}
+     approval_session_key = self._run_approval_sessions.get(run_id)
+     for failed, message, code, status in (
+-        (raw_request_id is not None and (not request_id or len(request_id) > 256),
++        (not request_id.strip() or len(request_id) > 256,
+          "Approval request_id is invalid.", "invalid_approval_request", 400),
+         (choice not in allowed,
+          "Invalid approval choice; expected one of: " + ", ".join(sorted(allowed)),
+          "invalid_approval_choice", 400),
+-        (room_scoped and resolve_all,
+-         "Room approvals can resolve only one exact request", "invalid_approval_scope", 400),
+-        (room_scoped and not request_id,
+-         "Room approvals require the exact request_id.", "approval_request_required", 400),
+-        (not approval_session_key,
+-         f"Run has no active approval session: {run_id}", "approval_not_active", 409)):
++    ):
+         if failed:
+             return _json_error(_openai_error, message, code=code, status=status)
++    scope = self._run_idempotency_scope(request)
++    try:
++        receipt = self._run_idempotency_store.get_approval_receipt(scope, run_id, request_id)
++    except Exception:
++        logger.exception("[api_server] approval receipt lookup unavailable")
++        return _json_error(
++            _openai_error,
++            "Approval receipt storage is unavailable.",
++            code="approval_receipt_unavailable",
++            status=503,
++        )
++    if receipt is not None:
++        if receipt["state"] == "committed" and receipt["resolved"] == 1:
++            if receipt["choice"] == choice:
++                return web.json_response({
++                    "object": "hermes.run.approval_response",
++                    "run_id": run_id,
++                    "request_id": request_id,
++                    "choice": choice,
++                    "resolved": 1,
++                })
++            return _json_error(
++                _openai_error,
++                "Approval request already has a different committed choice.",
++                code="approval_choice_conflict",
++                status=409,
++            )
++        return _json_error(
++            _openai_error,
++            "Approval request has an unresolved durable receipt.",
++            code="approval_receipt_uncommitted",
++            status=409,
++        )
++    if not approval_session_key:
++        return _json_error(
++            _openai_error,
++            f"Run has no active approval session: {run_id}",
++            code="approval_not_active",
++            status=409,
++        )
++
++    def prepare_receipt():
++        self._run_idempotency_store.prepare_approval_receipt(scope, run_id, request_id, choice)
++
++    def commit_receipt_after_release():
++        status = self._set_run_status(run_id, "running", last_event="approval.responded")
++        durable = self._run_idempotency_store.status_for_run(scope, run_id)
++        durable_status = durable.get("status") if durable is not None else None
++        if (
++            status.get("status") != "running"
++            or durable_status is None
++            or durable_status.get("status") != "running"
++            or durable_status.get("last_event") != "approval.responded"
++        ):
++            raise RuntimeError("approval Run status was not durably updated")
++        event_stream = self._run_streams.get(run_id)
++        if event_stream is not None:
++            with suppress(Exception):
++                event_stream.put_nowait(
++                    _run_event(run_id, "approval.responded", choice=choice, request_id=request_id, resolved=1)
++                )
++        committed = self._run_idempotency_store.commit_approval_receipt(scope, run_id, request_id)
++        if (
++            committed is None
++            or committed["run_id"] != run_id
++            or committed["request_id"] != request_id
++            or committed["choice"] != choice
++            or committed["state"] != "committed"
++            or committed["resolved"] != 1
++        ):
++            raise RuntimeError("approval receipt was not durably committed")
++
+     try:
+         from tools.approval import resolve_gateway_approval
+         resolved = resolve_gateway_approval(
+-            approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
+-    except Exception as exc:
+-        logger.exception("[api_server] approval resolution failed for run %s", run_id)
+-        return _json_error(_openai_error, str(exc), status=500)
+-    if resolved <= 0:
++            approval_session_key,
++            choice,
++            request_id=request_id,
++            before_release=prepare_receipt,
++            after_release=commit_receipt_after_release,
++        )
++    except ValueError:
++        return _json_error(
++            _openai_error,
++            "Approval request already has a durable receipt.",
++            code="approval_receipt_conflict",
++            status=409,
++        )
++    except Exception:
++        logger.exception("[api_server] approval decision could not be durably recorded")
++        return _json_error(
++            _openai_error,
++            "Approval decision could not be durably recorded.",
++            code="approval_receipt_unavailable",
++            status=503,
++        )
++    if resolved != 1:
+         return _json_error(
+             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
+-    request_id_field = {"request_id": request_id} if request_id else {}
+-    _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
+     return web.json_response({
+-        "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
+-        "resolved": resolved})
++        "object": "hermes.run.approval_response",
++        "run_id": run_id,
++        "request_id": request_id,
++        "choice": choice,
++        "resolved": 1,
++    })
+ 
+ 
+ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+diff --git a/tests/gateway/test_api_server_run_idempotency.py b/tests/gateway/test_api_server_run_idempotency.py
+index 53275d8..6c555f4 100644
+--- a/tests/gateway/test_api_server_run_idempotency.py
++++ b/tests/gateway/test_api_server_run_idempotency.py
+@@ -6,6 +6,105 @@ import pytest
+ 
+ from gateway.config import Platform, PlatformConfig
+ from gateway.platforms import api_server
++from gateway.platforms import api_server_run_idempotency as run_idempotency
++from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
++
++
++def test_approval_receipts_are_scope_bound_durable_and_retained(tmp_path, monkeypatch):
++    now = 1_800_000_000.0
++    monkeypatch.setattr(run_idempotency.time, "time", lambda: now)
++    db_path = str(tmp_path / "runs.db")
++    store = RunIdempotencyStore(db_path)
++
++    store.prepare_approval_receipt("scope-a", "run-a", "req-1", "once")
++    store.prepare_approval_receipt("scope-b", "run-b", "req-1", "deny")
++    assert store.get_approval_receipt("scope-a", "run-a", "req-1")["state"] == "prepared"
++    assert store.get_approval_receipt("scope-b", "run-b", "req-1")["choice"] == "deny"
++    assert store.get_approval_receipt("scope-a", "run-b", "req-1") is None
++    store.close()
++
++    monkeypatch.setattr(run_idempotency.time, "time", lambda: now + 86_401)
++    restarted = RunIdempotencyStore(db_path)
++    assert restarted.get_approval_receipt("scope-a", "run-a", "req-1")["state"] == "prepared"
++    restarted.commit_approval_receipt("scope-a", "run-a", "req-1")
++    restarted.close()
++
++    after_restart = RunIdempotencyStore(db_path)
++    receipt = after_restart.get_approval_receipt("scope-a", "run-a", "req-1")
++    assert receipt["choice"] == "once"
++    assert receipt["state"] == "committed"
++    assert receipt["resolved"] == 1
++    after_restart.close()
++
++
++def test_approval_receipts_fail_closed_without_durable_sqlite():
++    store = RunIdempotencyStore(":memory:")
++    with pytest.raises(RuntimeError, match="durable"):
++        store.prepare_approval_receipt("scope-a", "run-a", "req-1", "once")
++    with pytest.raises(RuntimeError, match="durable"):
++        store.get_approval_receipt("scope-a", "run-a", "req-1")
++    with pytest.raises(RuntimeError, match="durable"):
++        store.commit_approval_receipt("scope-a", "run-a", "req-1")
++    store.close()
++
++
++def test_terminal_run_expiry_prunes_its_approval_receipts(tmp_path, monkeypatch):
++    now = 1_800_000_000.0
++    monkeypatch.setattr(run_idempotency.time, "time", lambda: now)
++    store = RunIdempotencyStore(str(tmp_path / "receipt-expiry.db"))
++    store.reserve(
++        "scope-a",
++        "key-a",
++        "fingerprint-a",
++        "run-a",
++        {"run_id": "run-a", "status": "completed"},
++    )
++    store.prepare_approval_receipt("scope-a", "run-a", "req-1", "once")
++    store.commit_approval_receipt("scope-a", "run-a", "req-1")
++
++    monkeypatch.setattr(
++        run_idempotency.time,
++        "time",
++        lambda: now + RunIdempotencyStore.RETENTION_SECONDS + 1,
++    )
++    store.reserve(
++        "scope-b",
++        "key-b",
++        "fingerprint-b",
++        "run-b",
++        {"run_id": "run-b", "status": "running"},
++    )
++    assert store.get_approval_receipt("scope-a", "run-a", "req-1") is None
++    store.close()
++
++
++def test_fresh_receipt_survives_old_terminal_run_expiry(tmp_path, monkeypatch):
++    now = 1_800_000_000.0
++    monkeypatch.setattr(run_idempotency.time, "time", lambda: now)
++    store = RunIdempotencyStore(str(tmp_path / "fresh-receipt.db"))
++    store.reserve(
++        "scope-a", "key-a", "fingerprint-a", "run-a",
++        {"run_id": "run-a", "status": "completed"},
++    )
++    monkeypatch.setattr(
++        run_idempotency.time, "time",
++        lambda: now + RunIdempotencyStore.RETENTION_SECONDS - 1,
++    )
++    store.prepare_approval_receipt("scope-a", "run-a", "req-1", "once")
++    store.commit_approval_receipt("scope-a", "run-a", "req-1")
++    monkeypatch.setattr(
++        run_idempotency.time, "time",
++        lambda: now + RunIdempotencyStore.RETENTION_SECONDS + 1,
++    )
++    store.reserve(
++        "scope-b", "key-b", "fingerprint-b", "run-b",
++        {"run_id": "run-b", "status": "running"},
++    )
++    assert store.status_for_run("scope-a", "run-a") is not None
++    receipt = store.get_approval_receipt("scope-a", "run-a", "req-1")
++    assert receipt is not None
++    assert receipt["state"] == "committed"
++    store.close()
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index 0a85dda..7abeb96 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -11,8 +11,13 @@ Covers:
+ 
+ import asyncio
+ import hashlib
++import os
++import subprocess
++import sys
+ import threading
+ import time
++from pathlib import Path
++from urllib.parse import quote
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+@@ -27,6 +32,7 @@ from gateway.platforms.api_server import (
+     cors_middleware,
+     security_headers_middleware,
+ )
++from gateway.platforms import api_server, api_server_run_idempotency, api_server_runs
+ from tools import approval as approval_mod
+ from tools import approval_gateway_wait
+ 
+@@ -81,6 +87,12 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
+     """Create an aiohttp app with /v1/runs routes registered."""
+     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+     app = web.Application(middlewares=mws)
++
++    async def get_run_approval_receipt(request):
++        return await api_server_runs._handle_get_run_approval_receipt(
++            adapter, request, _api_server=api_server
++        )
++
+     app["api_server_adapter"] = adapter
+     app.router.add_post("/v1/runs", adapter._handle_runs)
+     app.router.add_post(
+@@ -100,6 +112,10 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
+         adapter._handle_room_member_grant_revoke,
+     )
+     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
++    app.router.add_get(
++        "/v1/runs/{run_id}/approvals/{request_id}",
++        get_run_approval_receipt,
++    )
+     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+@@ -148,6 +164,373 @@ def auth_adapter():
+     return _make_adapter(api_key="sk-secret")
+ 
+ 
++async def _start_run_with_waiting_approval(client, adapter, request_id):
++    agent, ready, interrupted = _make_slow_agent()
++    with patch.object(adapter, "_create_agent", return_value=agent):
++        response = await client.post(
++            "/v1/runs",
++            json={"input": "approval receipt test"},
++            headers={
++                "Authorization": "Bearer sk-secret",
++                "Idempotency-Key": f"approval-receipt-{time.monotonic_ns()}",
++            },
++        )
++    assert response.status == 202
++    run_id = (await response.json())["run_id"]
++    assert ready.wait(timeout=3.0)
++    adapter._set_run_status(run_id, "waiting_for_approval", approval={"request_id": request_id})
++
++    result = {}
++    started = threading.Event()
++
++    def wait_for_approval():
++        started.set()
++        result.update(
++            approval_gateway_wait._await_gateway_decision(
++                run_id,
++                lambda _approval: None,
++                {
++                    "command": "receipt fixture command",
++                    "description": "receipt fixture",
++                    "pattern_keys": ["shell"],
++                    "request_id": request_id,
++                },
++            )
++        )
++
++    waiter = threading.Thread(target=wait_for_approval, daemon=True)
++    waiter.start()
++    assert started.wait(timeout=1.0)
++    deadline = time.monotonic() + 3.0
++    entry = None
++    while time.monotonic() < deadline:
++        with approval_mod._lock:
++            entry = next(
++                (item for item in approval_mod._gateway_queues.get(run_id, [])
++                 if item.data.get("request_id") == request_id),
++                None,
++            )
++        if entry is not None:
++            break
++        time.sleep(0.01)
++    assert entry is not None
++    return run_id, agent, interrupted, entry, waiter, result
++
++
++class TestRunApprovalReceipts:
++    @pytest.mark.asyncio
++    async def test_same_request_id_is_isolated_between_authenticated_run_owners(self, tmp_path):
++        request_id = "shared-request-id"
++        store = api_server_run_idempotency.RunIdempotencyStore(
++            str(tmp_path / "two-run-owners.db")
++        )
++        with patch.object(api_server, "RunIdempotencyStore", return_value=store):
++            owner_a = _make_adapter("sk-lab-a")
++            owner_b = _make_adapter("sk-lab-b")
++
++        owners = (
++            (owner_a, "run-lab-a", "once", "sk-lab-a"),
++            (owner_b, "run-lab-b", "deny", "sk-lab-b"),
++        )
++        for adapter, run_id, choice, _api_key in owners:
++            scope = adapter._run_idempotency_scope(MagicMock(headers={}))
++            status = {"status": "running"}
++            store.reserve(
++                scope,
++                f"idem-{run_id}",
++                f"fingerprint-{run_id}",
++                run_id,
++                status,
++                owner_pid=adapter._run_owner_pid,
++                owner_started=adapter._run_owner_started,
++            )
++            adapter._run_statuses[run_id] = status
++            adapter._run_idempotency_ids.add(run_id)
++            adapter._run_owners[run_id] = scope
++            store.prepare_approval_receipt(scope, run_id, request_id, choice)
++            store.commit_approval_receipt(scope, run_id, request_id)
++
++        try:
++            async with (
++                TestClient(TestServer(_create_runs_app(owner_a))) as client_a,
++                TestClient(TestServer(_create_runs_app(owner_b))) as client_b,
++            ):
++                own_a = await client_a.get(
++                    f"/v1/runs/run-lab-a/approvals/{request_id}",
++                    headers={"Authorization": "Bearer sk-lab-a"},
++                )
++                own_b = await client_b.get(
++                    f"/v1/runs/run-lab-b/approvals/{request_id}",
++                    headers={"Authorization": "Bearer sk-lab-b"},
++                )
++                cross_a_to_b = await client_a.get(
++                    f"/v1/runs/run-lab-b/approvals/{request_id}",
++                    headers={"Authorization": "Bearer sk-lab-a"},
++                )
++                cross_b_to_a = await client_b.get(
++                    f"/v1/runs/run-lab-a/approvals/{request_id}",
++                    headers={"Authorization": "Bearer sk-lab-b"},
++                )
++
++                assert own_a.status == 200
++                assert (await own_a.json())["choice"] == "once"
++                assert own_b.status == 200
++                assert (await own_b.json())["choice"] == "deny"
++                assert cross_a_to_b.status == 404
++                assert cross_b_to_a.status == 404
++        finally:
++            store.close()
++
++    @pytest.mark.asyncio
++    async def test_receipt_replays_exact_choice_and_encoded_request_id(self, auth_adapter):
++        app = _create_runs_app(auth_adapter)
++        request_id = "req/slash%value"
++        async with TestClient(TestServer(app)) as client:
++            run_id, agent, interrupted, entry, waiter, result = await _start_run_with_waiting_approval(
++                client, auth_adapter, request_id
++            )
++            try:
++                response = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": request_id},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                expected = {
++                    "object": "hermes.run.approval_response",
++                    "run_id": run_id,
++                    "request_id": request_id,
++                    "choice": "once",
++                    "resolved": 1,
++                }
++                assert response.status == 200
++                assert await response.json() == expected
++                waiter.join(timeout=2.0)
++                assert result["resolved"] is True
++                assert result["choice"] == "once"
++
++                encoded_request_id = quote(request_id, safe="")
++                receipt = await client.get(
++                    f"/v1/runs/{run_id}/approvals/{encoded_request_id}",
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert receipt.status == 200
++                assert await receipt.json() == expected
++
++                replay = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": request_id},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert replay.status == 200
++                assert await replay.json() == expected
++                opposite = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "deny", "request_id": request_id},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert opposite.status == 409
++            finally:
++                interrupted.set()
++                waiter.join(timeout=2.0)
++                agent.interrupt()
++
++    @pytest.mark.asyncio
++    async def test_receipt_prepare_failure_does_not_release_waiter(self, auth_adapter, monkeypatch):
++        app = _create_runs_app(auth_adapter)
++        async with TestClient(TestServer(app)) as client:
++            run_id, agent, interrupted, entry, waiter, result = await _start_run_with_waiting_approval(
++                client, auth_adapter, "req-before-release"
++            )
++
++            def fail_prepare(*_args, **_kwargs):
++                raise OSError("private storage detail")
++
++            monkeypatch.setattr(
++                auth_adapter._run_idempotency_store,
++                "prepare_approval_receipt",
++                fail_prepare,
++                raising=False,
++            )
++            try:
++                response = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": "req-before-release"},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert response.status == 503
++                assert "private storage detail" not in await response.text()
++                assert entry.result is None
++                assert not entry.event.is_set()
++                assert result == {}
++            finally:
++                approval_mod.withdraw_gateway_approval(run_id, "req-before-release", "test cleanup")
++                waiter.join(timeout=2.0)
++                interrupted.set()
++                agent.interrupt()
++
++    @pytest.mark.asyncio
++    async def test_receipt_commit_failure_withdraws_released_choice(self, auth_adapter, monkeypatch):
++        app = _create_runs_app(auth_adapter)
++        async with TestClient(TestServer(app)) as client:
++            run_id, agent, interrupted, entry, waiter, result = await _start_run_with_waiting_approval(
++                client, auth_adapter, "req-before-commit"
++            )
++
++            callback_saw_event = []
++
++            def fail_commit(*_args, **_kwargs):
++                callback_saw_event.append(entry.event.is_set())
++                raise OSError("private commit detail")
++
++            monkeypatch.setattr(
++                auth_adapter._run_idempotency_store,
++                "commit_approval_receipt",
++                fail_commit,
++                raising=False,
++            )
++            try:
++                response = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": "req-before-commit"},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert response.status == 503
++                assert "private commit detail" not in await response.text()
++                assert callback_saw_event == [True]
++                assert entry.event.is_set()
++                waiter.join(timeout=2.0)
++                assert not waiter.is_alive()
++                assert result["choice"] is None
++                assert result["cancelled"] == "approval decision could not be durably recorded"
++                receipt = auth_adapter._run_idempotency_store.get_approval_receipt(
++                    auth_adapter._run_owners[run_id], run_id, "req-before-commit"
++                )
++                assert receipt["state"] == "prepared"
++            finally:
++                interrupted.set()
++                agent.interrupt()
++
++    @pytest.mark.asyncio
++    async def test_committed_receipt_replays_after_response_failure(self, auth_adapter, monkeypatch):
++        app = _create_runs_app(auth_adapter)
++        async with TestClient(TestServer(app)) as client:
++            run_id, agent, interrupted, entry, waiter, result = await _start_run_with_waiting_approval(
++                client, auth_adapter, "req-response-lost"
++            )
++            original_json_response = api_server_runs.web.json_response
++            failed = False
++
++            def fail_first_receipt_response(data=None, *args, **kwargs):
++                nonlocal failed
++                if not failed and isinstance(data, dict) and data.get("object") == "hermes.run.approval_response":
++                    failed = True
++                    raise RuntimeError("response delivery failed")
++                return original_json_response(data, *args, **kwargs)
++
++            monkeypatch.setattr(api_server_runs.web, "json_response", fail_first_receipt_response)
++            try:
++                first = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": "req-response-lost"},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert first.status == 500
++                waiter.join(timeout=2.0)
++                assert result["choice"] == "once"
++
++                replay = await client.post(
++                    f"/v1/runs/{run_id}/approval",
++                    json={"choice": "once", "request_id": "req-response-lost"},
++                    headers={"Authorization": "Bearer sk-secret"},
++                )
++                assert replay.status == 200
++                assert (await replay.json())["choice"] == "once"
++                assert entry.result == "once"
++            finally:
++                interrupted.set()
++                agent.interrupt()
++
++    @pytest.mark.asyncio
++    async def test_receipt_crash_after_commit_recovers_run_as_interrupted(self, tmp_path):
++        db_path = tmp_path / "crash-window.db"
++        run_id_path = tmp_path / "crash-window-run-id"
++        child_env = {
++            **os.environ,
++            "HERMES_RECEIPT_CRASH_CHILD": "1",
++            "HERMES_RECEIPT_CRASH_DB": str(db_path),
++            "HERMES_RECEIPT_CRASH_RUN_ID": str(run_id_path),
++        }
++        child = subprocess.run(
++            [
++                sys.executable,
++                "-m",
++                "pytest",
++                "-q",
++                f"{Path(__file__)}::TestRunApprovalReceipts::test_receipt_crash_child_process",
++            ],
++            env=child_env,
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        assert child.returncode == 73, child.stdout + child.stderr
++        run_id = run_id_path.read_text()
++
++        with patch.object(
++            api_server,
++            "RunIdempotencyStore",
++            lambda: api_server_run_idempotency.RunIdempotencyStore(str(db_path)),
++        ):
++            restarted = _make_adapter(api_key="sk-secret")
++        app = _create_runs_app(restarted)
++        async with TestClient(TestServer(app)) as client:
++            headers = {"Authorization": "Bearer sk-secret"}
++            status = await client.get(f"/v1/runs/{run_id}", headers=headers)
++            assert status.status == 200
++            assert (await status.json())["status"] == "interrupted"
++
++            receipt = await client.get(
++                f"/v1/runs/{run_id}/approvals/req-crash-window",
++                headers=headers,
++            )
++            assert receipt.status == 200
++            assert (await receipt.json())["choice"] == "once"
++
++    @pytest.mark.asyncio
++    async def test_receipt_crash_child_process(self):
++        if os.environ.get("HERMES_RECEIPT_CRASH_CHILD") != "1":
++            pytest.skip("runs only in the crash-window subprocess")
++
++        db_path = os.environ["HERMES_RECEIPT_CRASH_DB"]
++        run_id_path = os.environ["HERMES_RECEIPT_CRASH_RUN_ID"]
++        with patch.object(
++            api_server,
++            "RunIdempotencyStore",
++            lambda: api_server_run_idempotency.RunIdempotencyStore(db_path),
++        ):
++            adapter = _make_adapter(api_key="sk-secret")
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as client:
++            run_id, _agent, _interrupted, entry, _waiter, _result = (
++                await _start_run_with_waiting_approval(
++                    client, adapter, "req-crash-window"
++                )
++            )
++            Path(run_id_path).write_text(run_id)
++            commit = adapter._run_idempotency_store.commit_approval_receipt
++
++            def commit_then_crash(scope, committed_run_id, request_id):
++                commit(scope, committed_run_id, request_id)
++                os._exit(73 if entry.event.is_set() and approval_mod._lock.locked() else 74)
++
++            adapter._run_idempotency_store.commit_approval_receipt = commit_then_crash
++            await client.post(
++                f"/v1/runs/{run_id}/approval",
++                json={"choice": "once", "request_id": "req-crash-window"},
++                headers={"Authorization": "Bearer sk-secret"},
++            )
++
++
+ # ---------------------------------------------------------------------------
+ # POST /v1/runs — start a run
+ # ---------------------------------------------------------------------------
+@@ -626,8 +1009,8 @@ class TestRunEvents:
+ 
+ 
+     @pytest.mark.asyncio
+-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+-        """Same client session_id must not let one run approve another run's queue."""
++    async def test_approval_rejects_resolve_all_without_releasing_any_run(self, auth_adapter):
++        """The private endpoint accepts one exact decision, never a broad resolver."""
+         app = _create_runs_app(auth_adapter)
+         async with TestClient(TestServer(app)) as cli:
+             with patch.object(auth_adapter, "_create_agent") as mock_create:
+@@ -672,26 +1055,32 @@ class TestRunEvents:
+ 
+                 approval_resp = await cli.post(
+                     f"/v1/runs/{attacker_run}/approval",
+-                    json={"choice": "always", "resolve_all": True},
++                    json={
++                        "choice": "once",
++                        "request_id": attacker_entry.data["request_id"],
++                        "resolve_all": True,
++                    },
+                     headers={"Authorization": "Bearer sk-secret"},
+                 )
+                 approval_data = await approval_resp.json()
+ 
+-                assert approval_resp.status == 200
+-                assert approval_data["resolved"] == 1
+-                assert attacker_entry.result == "always"
+-                assert attacker_entry.event.is_set()
++                assert approval_resp.status == 400
++                assert approval_data["error"]["code"] == "invalid_approval_scope"
++                assert attacker_entry.result is None
++                assert not attacker_entry.event.is_set()
+                 assert victim_entry.result is None
+                 assert not victim_entry.event.is_set()
+                 with approval_mod._lock:
+                     assert approval_mod._gateway_queues[victim_run] == [victim_entry]
++                    assert approval_mod._gateway_queues[attacker_run] == [attacker_entry]
+                     assert victim_run in approval_mod._gateway_queues
+-                    assert attacker_run not in approval_mod._gateway_queues
++                    assert attacker_run in approval_mod._gateway_queues
+ 
+-                # Clean up the synthetic pending victim approval and unblock the
++                # Clean up both synthetic pending approvals and unblock the
+                 # slow test agents so their background run tasks can finish.
+                 with approval_mod._lock:
+                     approval_mod._gateway_queues.pop(victim_run, None)
++                    approval_mod._gateway_queues.pop(attacker_run, None)
+                 victim_interrupted.set()
+                 attacker_interrupted.set()
+ 
+@@ -907,8 +1296,9 @@ class TestSteerRun:
+ class TestRunLifecycleSweep:
+ 
+     @pytest.mark.asyncio
+-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
++    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter, tmp_path):
+         """Stream TTL bounds buffering without detaching a live run."""
++        _use_idempotency_db(adapter, tmp_path / "lifecycle-sweep.db")
+         app = _create_runs_app(adapter)
+         adapter._max_concurrent_runs = 1
+ 
+@@ -917,7 +1307,11 @@ class TestRunLifecycleSweep:
+                 mock_agent, agent_ready, _ = _make_slow_agent()
+                 mock_create.return_value = mock_agent
+ 
+-                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
++                start_resp = await cli.post(
++                    "/v1/runs",
++                    json={"input": "hello"},
++                    headers={"Idempotency-Key": "approval-lifecycle-sweep"},
++                )
+                 assert start_resp.status == 202
+                 run_id = (await start_resp.json())["run_id"]
+                 assert agent_ready.wait(timeout=3.0)
+@@ -933,6 +1327,11 @@ class TestRunLifecycleSweep:
+                 })
+                 with approval_mod._lock:
+                     approval_mod._gateway_queues[run_id] = [pending]
++                adapter._set_run_status(
++                    run_id,
++                    "waiting_for_approval",
++                    approval={"request_id": pending.data["request_id"]},
++                )
+ 
+                 adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
+                 # Exercise one real sweeper iteration without waiting 60 seconds.
+@@ -955,7 +1354,7 @@ class TestRunLifecycleSweep:
+ 
+                 approval_resp = await cli.post(
+                     f"/v1/runs/{run_id}/approval",
+-                    json={"choice": "once"},
++                    json={"choice": "once", "request_id": pending.data["request_id"]},
+                 )
+                 assert approval_resp.status == 200
+                 assert pending.event.is_set()
+@@ -1737,9 +2136,10 @@ class TestRunIdempotency:
+ class TestHostedRoomRuns:
+     @pytest.mark.asyncio
+     async def test_room_approval_requires_and_resolves_exact_request_id(
+-        self, auth_adapter
++        self, auth_adapter, tmp_path
+     ):
+         run_id = "run-room-approval"
++        scope = "room-approval-scope"
+         current = approval_gateway_wait._ApprovalEntry({
+             "request_id": "approval-B",
+             "command": "rm -rf build-B",
+@@ -1750,6 +2150,18 @@ class TestHostedRoomRuns:
+             "status": "waiting_for_approval",
+             "approval": dict(current.data),
+         }
++        _use_idempotency_db(auth_adapter, tmp_path / "room-approval.db")
++        auth_adapter._run_idempotency_store.reserve(
++            scope,
++            "room-approval-key",
++            "room-approval-fingerprint",
++            run_id,
++            auth_adapter._run_statuses[run_id],
++            owner_pid=auth_adapter._run_owner_pid,
++            owner_started=auth_adapter._run_owner_started,
++        )
++        auth_adapter._run_idempotency_ids.add(run_id)
++        auth_adapter._run_owners[run_id] = scope
+         with approval_mod._lock:
+             approval_mod._gateway_queues[run_id] = [current]
+         app = _create_runs_app(auth_adapter)
+@@ -1757,10 +2169,11 @@ class TestHostedRoomRuns:
+             with (
+                 patch.object(auth_adapter, "_check_run_auth", return_value=None),
+                 patch.object(auth_adapter, "_request_owns_run", return_value=True),
+-                patch.object(
+-                    auth_adapter, "_room_grant_token", return_value="scoped-grant"
+-                ),
+-            ):
++                    patch.object(
++                        auth_adapter, "_room_grant_token", return_value="scoped-grant"
++                    ),
++                    patch.object(auth_adapter, "_run_idempotency_scope", return_value=scope),
++                ):
+                 async with TestClient(TestServer(app)) as cli:
+                     missing = await cli.post(
+                         f"/v1/runs/{run_id}/approval",
+@@ -1781,7 +2194,7 @@ class TestHostedRoomRuns:
+             approval_mod.unregister_gateway_notify(run_id)
+ 
+         assert missing.status == 400
+-        assert missing_body["error"]["code"] == "approval_request_required"
++        assert missing_body["error"]["code"] == "invalid_approval_scope"
+         assert stale.status == 409
+         assert stale_body["error"]["code"] == "approval_not_pending"
+         assert exact.status == 200
+@@ -1809,11 +2222,15 @@ class TestHostedRoomRuns:
+             async with TestClient(TestServer(app)) as cli:
+                 permanent = await cli.post(
+                     "/v1/runs/run-room/approval",
+-                    json={"choice": "always"},
++                    json={"choice": "always", "request_id": "approval-A"},
+                 )
+                 resolve_all = await cli.post(
+                     "/v1/runs/run-room/approval",
+-                    json={"choice": "once", "resolve_all": True},
++                    json={
++                        "choice": "once",
++                        "request_id": "approval-A",
++                        "resolve_all": True,
++                    },
+                 )
+                 permanent_body = await permanent.json()
+                 resolve_all_body = await resolve_all.json()
+diff --git a/tests/tools/test_approval_gateway_wait_late_choice.py b/tests/tools/test_approval_gateway_wait_late_choice.py
+index b6e901a..041c6b0 100644
+--- a/tests/tools/test_approval_gateway_wait_late_choice.py
++++ b/tests/tools/test_approval_gateway_wait_late_choice.py
+@@ -5,10 +5,89 @@ commit a choice between the poll giving up and the entry leaving the queue. The
+ choice committed under the approval lock — the client was acked ``ok`` for it — never "timeout".
+ """
+ 
++import threading
++
+ from tools import approval as mod
+ from tools import approval_gateway_wait as wait_mod
+ 
+ 
++def test_waiter_consumes_choice_under_lock_after_release_callback(monkeypatch):
++    _clear()
++    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
++    notify_ready = threading.Event()
++    callback_entered = threading.Event()
++    finish_callback = threading.Event()
++    choice_read = threading.Event()
++    waiter_finished = threading.Event()
++    callback_saw_event = []
++    choice_read_under_lock = []
++    result = {}
++    request_id = "receipt-lock-order"
++
++    def notify(_data):
++        notify_ready.set()
++
++    original_cancel_cause = wait_mod._cancel_cause
++
++    def cancel_cause_while_locked(state, entry):
++        choice_read.set()
++        choice_read_under_lock.append(mod._lock.locked())
++        return original_cancel_cause(state, entry)
++
++    monkeypatch.setattr(wait_mod, "_cancel_cause", cancel_cause_while_locked)
++
++    def wait_for_choice():
++        result.update(
++            wait_mod._await_gateway_decision(
++                SESSION_KEY,
++                notify,
++                {**APPROVAL, "request_id": request_id},
++            )
++        )
++        waiter_finished.set()
++
++    waiter = threading.Thread(target=wait_for_choice, daemon=True)
++    waiter.start()
++    assert notify_ready.wait(timeout=2)
++    with mod._lock:
++        entry = mod._gateway_queues[SESSION_KEY][0]
++
++    def durable_commit():
++        callback_saw_event.append(entry.event.is_set())
++        callback_entered.set()
++        assert finish_callback.wait(timeout=2)
++
++    resolved = []
++    resolver = threading.Thread(
++        target=lambda: resolved.append(
++            mod.resolve_gateway_approval(
++                SESSION_KEY,
++                "once",
++                request_id=request_id,
++                after_release=durable_commit,
++            )
++        ),
++        daemon=True,
++    )
++    resolver.start()
++    try:
++        assert callback_entered.wait(timeout=2)
++        assert callback_saw_event == [True]
++        assert not choice_read.wait(timeout=0.05)
++        assert not waiter_finished.is_set()
++    finally:
++        finish_callback.set()
++    resolver.join(timeout=2)
++    waiter.join(timeout=2)
++
++    assert not resolver.is_alive()
++    assert not waiter.is_alive()
++    assert resolved == [1]
++    assert result["choice"] == "once"
++    assert choice_read.is_set()
++    assert choice_read_under_lock == [True]
++
++
+ SESSION_KEY = "approval-late-choice"
+ APPROVAL = {"command": "rm -rf build", "description": "d", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]}
+ 
+@@ -18,6 +97,66 @@ def _clear():
+     mod._gateway_notify_cbs.clear()
+ 
+ 
++def test_coalesced_distinct_request_ids_need_distinct_once_receipts(tmp_path, monkeypatch):
++    import time
++
++    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
++
++    _clear()
++    monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 5)
++    store = RunIdempotencyStore(str(tmp_path / "coalesced.db"))
++    notices = []
++    results = {}
++    threads = []
++
++    def start(request_id):
++        def wait():
++            results[request_id] = wait_mod._await_gateway_decision(
++                SESSION_KEY, notices.append, {**APPROVAL, "request_id": request_id}
++            )
++
++        thread = threading.Thread(target=wait)
++        thread.start()
++        threads.append(thread)
++
++    def await_notices(count):
++        for _ in range(200):
++            if len(notices) == count:
++                return
++            time.sleep(0.005)
++        assert len(notices) == count
++
++    try:
++        start("leader-id")
++        await_notices(1)
++        start("follower-id")
++        time.sleep(0.05)
++        assert len(notices) == 1
++        store.prepare_approval_receipt("scope", "run", "leader-id", "once")
++        assert mod.resolve_gateway_approval(
++            SESSION_KEY, "once", request_id="leader-id",
++            after_release=lambda: store.commit_approval_receipt("scope", "run", "leader-id"),
++        ) == 1
++        await_notices(2)
++        assert notices[1]["request_id"] == "follower-id"
++        assert "follower-id" not in results
++        assert store.get_approval_receipt("scope", "run", "follower-id") is None
++        store.prepare_approval_receipt("scope", "run", "follower-id", "once")
++        assert mod.resolve_gateway_approval(
++            SESSION_KEY, "once", request_id="follower-id",
++            after_release=lambda: store.commit_approval_receipt("scope", "run", "follower-id"),
++        ) == 1
++        for thread in threads:
++            thread.join(timeout=2)
++            assert not thread.is_alive()
++        assert results["leader-id"]["choice"] == "once"
++        assert results["follower-id"]["choice"] == "once"
++        assert store.get_approval_receipt("scope", "run", "follower-id")["state"] == "committed"
++    finally:
++        _clear()
++        store.close()
++
++
+ def test_choice_landing_after_the_deadline_check_is_resolved(monkeypatch):
+     _clear()
+     hooks: list[tuple[str, dict]] = []
+diff --git a/tools/approval.py b/tools/approval.py
+index 627c7c9..e9e65de 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -138,7 +138,9 @@ def unregister_gateway_notify(session_key: str) -> None:
+ def resolve_gateway_approval(session_key: str, choice: str,
+                              resolve_all: bool = False,
+                              reason: Optional[str] = None,
+-                             request_id: Optional[str] = None) -> int:
++                             request_id: Optional[str] = None,
++                             before_release=None,
++                             after_release=None) -> int:
+     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
+ 
+     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
+@@ -153,12 +155,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
+             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+             if not targets:
+                 return 0
+-            queue[:] = [entry for entry in queue if entry not in targets]
++            if len(targets) != 1:
++                raise ValueError("request ID does not identify one pending approval")
+         elif resolve_all:
+             targets = list(queue)
+-            queue.clear()
+         else:
+-            targets = [queue.pop(0)]
++            targets = [queue[0]]
++        if before_release is not None:
++            before_release()
++        queue[:] = [entry for entry in queue if entry not in targets]
+         if not queue:
+             _gateway_queues.pop(session_key, None)
+         # Popping the entry and committing its outcome are ONE critical section: the waiter's
+@@ -168,8 +173,21 @@ def resolve_gateway_approval(session_key: str, choice: str,
+             entry.result = choice
+             if reason:
+                 entry.reason = reason
++        # Signal release while still holding _lock. Waiters must reacquire this lock before reading
++        # the choice, so the durable callback below finishes before any tool can consume it.
++        for entry in targets:
+             entry.event.set()
+-    return len(targets)
++        if after_release is not None:
++            try:
++                after_release()
++            except Exception:
++                for entry in targets:
++                    entry.result = None
++                    entry.reason = None
++                    entry.cancelled = "approval decision could not be durably recorded"
++                    entry.event.set()
++                raise
++        return len(targets)
+ 
+ 
+ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> bool:
+diff --git a/tools/approval_gateway_wait.py b/tools/approval_gateway_wait.py
+index c564997..5f90842 100644
+--- a/tools/approval_gateway_wait.py
++++ b/tools/approval_gateway_wait.py
+@@ -99,6 +99,8 @@ def _finish(payload: dict, resolved: bool, choice: str | None, reason, **extra)
+ 
+ 
+ def _await_coalesced_leader(session_key: str, leader, payload: dict):
++    from tools import approval as _approval
++
+     """Wait on an already-pending identical approval instead of re-prompting.
+     Adopts the leader's decision: ``session``/``always`` → approval (same dict
+     shape as a direct resolution; persistence stays the caller's and is
+@@ -111,14 +113,20 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
+     state = _poll_event(leader.event, session_key,
+                         interrupt_log="Coalesced approval wait interrupted — "
+                                       "returning deny for session %s")
+-    cancelled = _cancel_cause(state, leader)
++    if state == "timeout":
++        cancelled, choice, reason = None, None, None
++    else:
++        # The resolver signals the event before its durable callback, but holds this
++        # lock until that callback succeeds or withdraws the choice.
++        with _approval._lock:
++            cancelled = _cancel_cause(state, leader)
++            choice, reason = leader.result, leader.reason
+     if state == "interrupted":
+         # Deny only OUR follower; the leader thread handles its own signal.
+         choice, resolved = "deny", True
+     elif state == "timeout":
+         choice, resolved = None, False
+     else:
+-        choice = leader.result
+         resolved = choice is not None
+     if choice == "once":
+         # The post hook fires for the fresh prompt's own lifecycle, not here.
+@@ -166,14 +174,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
+         register_prepared_approval(session_key, entry)
+         _approval._gateway_queues.setdefault(session_key, []).append(entry)
+ 
+-    def _drop_entry(state: str) -> str | None:
+-        """Leave the queue and return the choice committed so far. Reading ``entry.result`` and
+-        removing the entry are one critical section under the approval lock: ``resolve_gateway_approval``
+-        commits under the same lock, so a choice that landed after the deadline check but before this
+-        removal is still ours to honour, and one arriving later finds no entry (the client is told
+-        nothing was pending instead of being acked "ok" while the agent denies)."""
++    def _drop_entry(state: str) -> tuple[str | None, str | None, str | None]:
++        """Snapshot outcome and leave the queue under the resolver's lock."""
+         with _approval._lock:
+             choice = entry.result
++            cancelled = _cancel_cause(state, entry)
++            reason = entry.reason
+             queue = _approval._gateway_queues.get(session_key, [])
+             if entry in queue:
+                 queue.remove(entry)
+@@ -192,7 +198,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
+                 settle(reason)
+             except Exception:
+                 logger.debug("approval settle hook failed", exc_info=True)
+-        return choice
++        return choice, cancelled, reason
+ 
+     # Plugins hear about the request before the gateway does (real-time observers).
+     _ctx._fire_approval_hook("pre_approval_request", **payload)
+@@ -208,17 +214,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
+ 
+     state = _poll_event(entry.event, session_key,
+                         interrupt_log="Approval wait interrupted — returning deny for session %s")
+-    cancelled = _cancel_cause(state, entry)
+     if state == "interrupted":
+         # Coalesced followers wake with the cause instead of a deny nobody issued.
+-        entry.cancelled = cancelled
+-        entry.event.set()
+-    choice = _drop_entry(state)
++        with _approval._lock:
++            entry.cancelled = get_interrupt_reason() or "turn interrupted"
++            entry.event.set()
++    choice, cancelled, reason = _drop_entry(state)
+     if state == "interrupted":
+         # Our own decision stays a fail-closed deny.
+         choice = "deny"
+     # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
+     # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
+-    resolved = state != "timeout" or choice is not None
++    resolved = choice is not None
+     extra = {"cancelled": cancelled} if cancelled else {}
+-    return _finish(payload, resolved, choice, entry.reason, **extra)
++    return _finish(payload, resolved, choice, reason, **extra)

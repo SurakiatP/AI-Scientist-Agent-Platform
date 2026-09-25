@@ -190,6 +190,30 @@ def test_publish_allocates_monotonic_ulids_and_sequences_per_run() -> None:
     assert len(first.event_id) == len(second.event_id) == 26
 
 
+def test_record_with_cursor_separates_database_write_from_fanout() -> None:
+    from scilab.events import EventService
+
+    database = Database()
+    database.add_run("run-1")
+    bus = Bus(database)
+    service = EventService(database, bus, clock=lambda: NOW)
+
+    with database.transaction():
+        with database.cursor() as cursor:
+            cursor.execute(
+                "SELECT set_config('scilab.current_lab_id', %s, true)",
+                ("scilab.current_lab_id", "lab-a"),
+            )
+            event = service.record_with_cursor(
+                cursor, identity(), "run-1", "run.state", event_payload(), "run-service"
+            )
+            assert len(database.events) == 1
+            assert bus.published == []
+
+    asyncio.run(service.fanout_recorded(event))
+    assert len(bus.published) == 1
+
+
 def test_publish_locks_parent_after_tenant_context_and_replays_exclusively() -> None:
     from scilab.events import EventService
 

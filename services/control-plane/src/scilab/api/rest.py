@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from scilab.identity import Identity
 from scilab.api.lab_admin import LastOwnerError, MemberConflictError
+from scilab.api.hermes_approval import HermesApprovalUnavailable
+from scilab.approvals import ApprovalStateError
 from scilab.sse import stream_events
 from scilab.tenancy import AuthorizationError, require_lab, require_scope
 
@@ -32,6 +34,13 @@ class RunRequest(BaseModel):
     skill_packs: list[str]
     budget: RunBudget
     options: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("options")
+    @classmethod
+    def supported_options(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if value:
+            raise ValueError("execution options are not supported")
+        return value
 
 
 class ApprovalRequest(BaseModel):
@@ -94,6 +103,14 @@ def create_app(
     event_streamer: Callable[..., Any] = stream_events,
 ) -> FastAPI:
     app = FastAPI(title="SciLab REST API", version="1.0.0")
+
+    @app.exception_handler(HermesApprovalUnavailable)
+    async def hermes_unavailable(_: Request, exc: HermesApprovalUnavailable) -> Response:
+        return JSONResponse({"detail": "Hermes approval unavailable"}, status_code=503)
+
+    @app.exception_handler(ApprovalStateError)
+    async def approval_conflict(_: Request, exc: ApprovalStateError) -> Response:
+        return JSONResponse({"detail": "approval conflict"}, status_code=409)
 
     @app.exception_handler(AuthorizationError)
     async def authorization_error(_: Request, exc: AuthorizationError) -> Response:

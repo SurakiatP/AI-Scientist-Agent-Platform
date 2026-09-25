@@ -1,0 +1,102 @@
+{{- $piProvider := required "runWorker.piProvider is required" (trim (toString (default "" .Values.runWorker.piProvider))) -}}
+{{- $reviewerProvider := required "runWorker.reviewerProvider is required" (trim (toString (default "" .Values.runWorker.reviewerProvider))) -}}
+{{- if eq $piProvider $reviewerProvider -}}
+{{- fail "runWorker.piProvider and runWorker.reviewerProvider must differ" -}}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-lab-operator
+  labels:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: lab-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-lab-operator
+rules:
+  - apiGroups: [scilab.ai]
+    resources: [labs]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [scilab.ai]
+    resources: [labs/status]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims, configmaps, services]
+    verbs: [patch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-lab-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-lab-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-lab-operator
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-lab-operator
+  labels:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: lab-operator
+spec:
+  replicas: {{ .Values.labOperator.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scilab
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: lab-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scilab
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: lab-operator
+    spec:
+      serviceAccountName: {{ .Release.Name }}-lab-operator
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: lab-operator
+          image: {{ include "scilab.image" (dict "path" "images.labOperator" "image" .Values.images.labOperator) | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: SCILAB_RUN_WORKER_IMAGE
+              value: {{ include "scilab.image" (dict "path" "images.runWorker" "image" .Values.images.runWorker) | quote }}
+            - name: SCILAB_DATABASE_SECRET_NAME
+              value: {{ required "externalSecrets.postgres is required" .Values.externalSecrets.postgres | quote }}
+            - name: SCILAB_NATS_SECRET_NAME
+              value: {{ required "externalSecrets.nats is required" .Values.externalSecrets.nats | quote }}
+            - name: SCILAB_MINIO_SECRET_NAME
+              value: {{ required "externalSecrets.minio is required" .Values.externalSecrets.minio | quote }}
+            - name: SCILAB_OPA_SECRET_NAME
+              value: {{ required "externalSecrets.opa is required" .Values.externalSecrets.opa | quote }}
+            - name: SCILAB_RELEASE_NAME
+              value: {{ .Release.Name | quote }}
+            - name: SCILAB_PI_PROVIDER
+              value: {{ $piProvider | quote }}
+            - name: SCILAB_REVIEWER_PROVIDER
+              value: {{ $reviewerProvider | quote }}
