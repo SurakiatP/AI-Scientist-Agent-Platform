@@ -166,6 +166,63 @@ class EventService:
             values["payload"] = json.loads(values["payload"])
         return RunEvent.model_validate(values)
 
+    def record_with_cursor(
+        self,
+        cursor: Any,
+        identity: Identity,
+        run_id: str,
+        event_type: object,
+        payload: Mapping[str, Any],
+        source: object,
+    ) -> RunEvent:
+        _subject(identity.lab_id, run_id)
+        prepared = _event_payload(event_type, payload)
+        self._run(cursor, identity, run_id, lock=True)
+        cursor.execute(
+            "SELECT event_id, seq FROM run_events "
+            "WHERE lab_id = %s AND run_id = %s ORDER BY seq DESC LIMIT 1",
+            (identity.lab_id, run_id),
+        )
+        latest = cursor.fetchone()
+        latest_values = _row_values(latest, ("event_id", "seq")) if latest is not None else None
+        seq = int(latest_values["seq"]) + 1 if latest_values else 1
+        now = self.clock()
+        event_id = _next_ulid(latest_values["event_id"] if latest_values else None, now, self.entropy)
+        event = RunEvent.model_validate(
+            {
+                "event_id": event_id,
+                "run_id": run_id,
+                "lab_id": identity.lab_id,
+                "ts": now,
+                "type": event_type,
+                "seq": seq,
+                "payload": prepared,
+                "source": source,
+            }
+        )
+        event_json = event.model_dump(mode="json", by_alias=True)
+        sql_payload = json.dumps(event_json["payload"], separators=(",", ":"), ensure_ascii=False)
+        cursor.execute(
+            "INSERT INTO run_events "
+            "(event_id, run_id, lab_id, ts, type, seq, payload, source) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (event.event_id, event.run_id, event.lab_id, event.ts, event.type, event.seq,
+             sql_payload, event.source),
+        )
+        return event
+
+    async def fanout_recorded(self, event: RunEvent) -> None:
+        event_json = event.model_dump(mode="json", by_alias=True)
+        try:
+            await self.bus.publish(
+                _subject(event.lab_id, event.run_id),
+                json.dumps(event_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            )
+            if event.type == "run.state" and self.push_notification is not None:
+                await self.push_notification(event)
+        except Exception as exc:
+            raise EventFanoutError(event, exc) from exc
+
     async def publish_event(
         self,
         identity: Identity,
@@ -174,49 +231,9 @@ class EventService:
         payload: Mapping[str, Any],
         source: object,
     ) -> RunEvent:
-        subject = _subject(identity.lab_id, run_id)
-        prepared = _event_payload(event_type, payload)
         with self._access(identity, "runs:write") as cursor:
-            self._run(cursor, identity, run_id, lock=True)
-            cursor.execute(
-                "SELECT event_id, seq FROM run_events "
-                "WHERE lab_id = %s AND run_id = %s ORDER BY seq DESC LIMIT 1",
-                (identity.lab_id, run_id),
-            )
-            latest = cursor.fetchone()
-            latest_values = _row_values(latest, ("event_id", "seq")) if latest is not None else None
-            seq = int(latest_values["seq"]) + 1 if latest_values else 1
-            now = self.clock()
-            event_id = _next_ulid(latest_values["event_id"] if latest_values else None, now, self.entropy)
-            event = RunEvent.model_validate(
-                {
-                    "event_id": event_id,
-                    "run_id": run_id,
-                    "lab_id": identity.lab_id,
-                    "ts": now,
-                    "type": event_type,
-                    "seq": seq,
-                    "payload": prepared,
-                    "source": source,
-                }
-            )
-            event_json = event.model_dump(mode="json", by_alias=True)
-            sql_payload = json.dumps(event_json["payload"], separators=(",", ":"), ensure_ascii=False)
-            cursor.execute(
-                "INSERT INTO run_events "
-                "(event_id, run_id, lab_id, ts, type, seq, payload, source) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (event.event_id, event.run_id, event.lab_id, event.ts, event.type, event.seq, sql_payload, event.source),
-            )
-        try:
-            await self.bus.publish(
-                subject,
-                json.dumps(event_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
-            )
-            if event.type == "run.state" and self.push_notification is not None:
-                await self.push_notification(event)
-        except Exception as exc:
-            raise EventFanoutError(event, exc) from exc
+            event = self.record_with_cursor(cursor, identity, run_id, event_type, payload, source)
+        await self.fanout_recorded(event)
         return event
 
     def replay_events(self, identity: Identity, run_id: str, from_seq: int = 0) -> list[RunEvent]:

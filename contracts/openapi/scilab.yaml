@@ -214,9 +214,17 @@ paths:
     post:
       operationId: uploadInput
       x-required-scopes: [runs:write]
-      requestBody: {$ref: '#/components/requestBodies/Object'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InputUploadRequest'}
       responses:
-        '200': {$ref: '#/components/responses/Json'}
+        '200':
+          description: Input accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InputUploadResponse'}
   /v1/labs/{lab}/ask:
     parameters:
       - $ref: '#/components/parameters/Lab'
@@ -251,13 +259,27 @@ paths:
       operationId: listApiKeys
       x-required-scopes: [lab:admin]
       responses:
-        '200': {$ref: '#/components/responses/Json'}
+        '200':
+          description: API keys without their generated secrets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/CredentialListItem'}
     post:
       operationId: createApiKey
       x-required-scopes: [lab:admin]
-      requestBody: {$ref: '#/components/requestBodies/Object'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NamedCredentialRequest'}
       responses:
-        '200': {$ref: '#/components/responses/Json'}
+        '200':
+          description: Created API key; its generated secret is returned only here
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GeneratedCredential'}
     delete:
       operationId: deleteApiKey
       x-required-scopes: [lab:admin]
@@ -276,13 +298,27 @@ paths:
       operationId: listPeers
       x-required-scopes: [lab:admin]
       responses:
-        '200': {$ref: '#/components/responses/Json'}
+        '200':
+          description: Peers without their generated secrets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/CredentialListItem'}
     post:
       operationId: createPeer
       x-required-scopes: [lab:admin]
-      requestBody: {$ref: '#/components/requestBodies/Object'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NamedCredentialRequest'}
       responses:
-        '200': {$ref: '#/components/responses/Json'}
+        '200':
+          description: Created peer; its generated secret is returned only here
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GeneratedCredential'}
   /v1/labs/{lab}/usage:
     parameters:
       - $ref: '#/components/parameters/Lab'
@@ -360,6 +396,57 @@ components:
             - {type: number, minimum: 0}
             - {type: string, pattern: '^[0-9]+(\\.[0-9]+)?$'}
             - {type: 'null'}
+    InputUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [name, media_type, data_base64]
+      properties:
+        name: {type: string, minLength: 1}
+        media_type: {type: string, minLength: 1}
+        data_base64: {type: string, format: byte}
+    InputUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [artifact_id]
+      properties:
+        artifact_id: {type: string, minLength: 1}
+    NamedCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1}
+    CredentialScopes:
+      type: array
+      items: {type: string, enum: [runs:read, runs:write]}
+      minItems: 2
+      maxItems: 2
+      uniqueItems: true
+    StoredCredentialScopes:
+      type: array
+      items: {type: string, enum: [runs:read, runs:write, runs:approve, artifacts:read, lab:admin]}
+      minItems: 1
+      uniqueItems: true
+    CredentialListItem:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: {type: string, minLength: 1}
+        name: {type: string, minLength: 1}
+        scopes: {$ref: '#/components/schemas/StoredCredentialScopes'}
+    GeneratedCredential:
+      type: object
+      additionalProperties: false
+      required: [id, name, secret, scopes]
+      properties:
+        id: {type: string, minLength: 1}
+        name: {type: string, minLength: 1}
+        secret:
+          type: string
+          minLength: 1
+          description: Generated credential secret, returned only in the creation response.
+        scopes: {$ref: '#/components/schemas/CredentialScopes'}
     Object:
       type: object
       additionalProperties: true
@@ -384,7 +471,7 @@ components:
             max_minutes: {type: integer, minimum: 1}
         options:
           type: object
-          additionalProperties: true
+          maxProperties: 0
           default: {}
     ApprovalRequest:
       type: object

@@ -48,7 +48,10 @@ class Cursor:
         if compact.startswith("select set_config"):
             self.database.current_lab_id = params[1]
         elif compact.startswith("insert into runs"):
-            self.database.insert(params)
+            self.result = self.database.insert(params)
+        elif compact.startswith("select request_payload, actor from runs"):
+            row = next((row for row in self.database.rows if row["lab_id"] == params[0] and row["id"] == params[1]), None)
+            self.result = None if row is None else (row.get("request_payload"), row.get("actor"))
         elif compact.startswith("select") and "for update" in compact:
             self.result = self.database.find(params[0], params[1])
         elif compact.startswith("select") and "order by" in compact:
@@ -59,6 +62,12 @@ class Cursor:
             self.result = self.database.find_key(params[0], params[1])
         elif compact.startswith("select"):
             self.result = self.database.find(params[0], params[1])
+        elif compact.startswith("update runs set request_payload"):
+            payload, actor, lab_id, run_id = params
+            row = next(row for row in self.database.rows if row["lab_id"] == lab_id and row["id"] == run_id)
+            row["request_payload"] = payload
+            row["actor"] = actor
+            self.result = (run_id,)
         elif compact.startswith("update runs"):
             self.database.update(params)
 
@@ -112,6 +121,8 @@ class Database:
             for existing in self.rows
         ):
             self.rows.append(row)
+            return (row["id"],)
+        return None
 
     def find(self, lab_id, run_id):
         return next(

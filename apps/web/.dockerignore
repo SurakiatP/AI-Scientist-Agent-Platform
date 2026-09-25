@@ -1,0 +1,13 @@
+*
+!package.json
+!pnpm-lock.yaml
+!next.config.ts
+!next-env.d.ts
+!tsconfig.json
+!app/
+!app/**
+!lib/
+!lib/**
+**/.env*
+**/*.pem
+**/*.key

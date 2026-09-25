@@ -31,10 +31,12 @@ export default function LabPage({ params }: { params: Promise<{ id: string }> })
   const [keyName, setKeyName] = useState("");
   const [keyOnce, setKeyOnce] = useState("");
   const [peerName, setPeerName] = useState("");
+  const [peerOnce, setPeerOnce] = useState("");
   const [status, setStatus] = useState<"loading" | "ready" | "denied">("loading");
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
+    setPeerOnce("");
     const identity: Me = await read(await apiFetch("/v1/me"));
     setMe(identity);
     if (identity.lab_id !== id || !identity.scopes.includes("lab:admin")) { setStatus("denied"); return; }
@@ -67,6 +69,10 @@ export default function LabPage({ params }: { params: Promise<{ id: string }> })
         setError("สร้าง key แล้ว แต่ API ไม่ส่ง secret; โปรดตรวจสอบ backend ก่อนใช้งาน อย่าสร้างซ้ำ");
         return null;
       }
+      if (path === "peers" && method === "POST" && (typeof result?.secret !== "string" || !result.secret)) {
+        setError("สร้าง peer แล้ว แต่ API ไม่ส่ง secret; โปรดตรวจสอบ backend ก่อนใช้งาน อย่าสร้างซ้ำ");
+        return null;
+      }
       return result;
     } catch (cause) { setError(cause instanceof Error ? cause.message : "ดำเนินการไม่ได้"); return null; }
   }
@@ -82,7 +88,7 @@ export default function LabPage({ params }: { params: Promise<{ id: string }> })
       </section>
       <section className={styles.panel}><h2>งบ Lab</h2><p className={styles.help}>{budget.budget_thb === null ? "ยังไม่ได้ตั้งงบ" : `เพดานปัจจุบัน ${budget.budget_thb} THB`}</p><form onSubmit={(event) => { event.preventDefault(); const value = budgetText.trim() === "" ? null : budgetText.trim(); if (value !== null && !/^(0|[1-9]\d*)(\.\d+)?$/.test(value)) { setError("งบต้องเป็นเลขฐานสิบไม่ติดลบ"); return; } void mutate("budget", "PUT", { budget_thb: value }); }}><label>งบ (THB) · เว้นว่างเพื่อล้างค่า<input type="text" inputMode="decimal" value={budgetText} onChange={(event) => setBudgetText(event.target.value)} /></label><button type="submit">บันทึกงบ</button></form><h3>การใช้งานเดือนนี้</h3><pre>{usage === null ? "ยังไม่มีข้อมูล" : JSON.stringify(usage, null, 2)}</pre></section>
       <section className={styles.panel}><h2>API keys</h2><ul className={styles.list}>{keys.map((key) => <li key={key.id}><span>{key.name || key.id}</span><button type="button" onClick={() => void mutate(`api-keys?key_id=${encodeURIComponent(key.id)}`, "DELETE")}>ลบ</button></li>)}</ul><form onSubmit={(event) => { event.preventDefault(); setKeyOnce(""); void mutate("api-keys", "POST", { name: keyName.trim() }).then((value) => { if (value) { setKeyName(""); setKeyOnce(value.secret || value.api_key || ""); } }); }}><label>ชื่อ key<input required value={keyName} onChange={(event) => setKeyName(event.target.value)} /></label><button type="submit">สร้าง key</button></form>{keyOnce && <p role="status" className={styles.once}>แสดงครั้งเดียว: <code>{keyOnce}</code></p>}</section>
-      <section className={styles.panel}><h2>Peers</h2><ul className={styles.list}>{peers.map((peer) => <li key={peer.id}>{peer.name || peer.id}</li>)}</ul><form onSubmit={(event) => { event.preventDefault(); void mutate("peers", "POST", { name: peerName.trim() }).then((value) => { if (value) setPeerName(""); }); }}><label>ชื่อ peer<input required value={peerName} onChange={(event) => setPeerName(event.target.value)} /></label><button type="submit">เพิ่ม peer</button></form></section>
+      <section className={styles.panel}><h2>Peers</h2><ul className={styles.list}>{peers.map((peer) => <li key={peer.id}>{peer.name || peer.id}</li>)}</ul><form onSubmit={(event) => { event.preventDefault(); setPeerOnce(""); void mutate("peers", "POST", { name: peerName.trim() }).then((value) => { if (value) { setPeerName(""); setPeerOnce(value.secret); } }); }}><label>ชื่อ peer<input required value={peerName} onChange={(event) => setPeerName(event.target.value)} /></label><button type="submit">เพิ่ม peer</button></form>{peerOnce && <p role="status" className={styles.once}>แสดงครั้งเดียว: <code>{peerOnce}</code></p>}</section>
     </div>}
     {error && status === "ready" && <p role="alert" className={styles.error}>{error}</p>}
     {me && <p className={styles.identity}>Signed in: {me.principal}</p>}

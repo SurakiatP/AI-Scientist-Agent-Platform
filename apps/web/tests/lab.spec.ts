@@ -70,3 +70,66 @@ test("viewer never sees Lab mutation controls", async ({ page }) => {
   await expect(page.getByText("ไม่สามารถเปิดส่วนจัดการ Lab")).toBeVisible();
   await expect(page.getByRole("button", { name: "เพิ่มสมาชิก" })).toHaveCount(0);
 });
+
+test("Lab owner sees peer secrets once and clears them on refresh, incomplete create, error, and reload", async ({ page }) => {
+  const members: { subject: string; role: string }[] = [];
+  const peers: { id: string; name?: string }[] = [{ id: "existing-peer" }];
+  await page.route("**/v1/me", (route) => route.fulfill({ json: { principal: "user:owner", lab_id: "lab-a", scopes: ["lab:admin"] } }));
+  await page.route("**/v1/labs/lab-a/members", async (route) => {
+    if (route.request().method() === "POST") {
+      const member = route.request().postDataJSON();
+      members.push(member);
+      return route.fulfill({ status: 201, json: member });
+    }
+    return route.fulfill({ json: { members } });
+  });
+  await page.route("**/v1/labs/lab-a/budget", (route) => route.fulfill({ json: { budget_thb: null } }));
+  await page.route("**/v1/labs/lab-a/api-keys", (route) => route.fulfill({ json: [] }));
+  await page.route("**/v1/labs/lab-a/usage?period=monthly", (route) => route.fulfill({ json: { period: "monthly", cost_thb: 0 } }));
+  await page.route("**/v1/labs/lab-a/peers", async (route) => {
+    if (route.request().method() !== "POST") return route.fulfill({ json: peers });
+    const { name } = route.request().postDataJSON();
+    if (name === "server-error") return route.fulfill({ status: 500, json: { detail: "creation failed" } });
+    const created = { id: `peer-${peers.length}`, name };
+    peers.push(created);
+    if (name === "missing-secret") {
+      return route.fulfill({ status: 201, json: { ...created, scopes: ["runs:read", "runs:write"] } });
+    }
+    return route.fulfill({
+      status: 201,
+      json: { ...created, secret: `secret-${name}`, scopes: ["runs:read", "runs:write"] },
+    });
+  });
+
+  await page.goto("/labs/lab-a");
+  const peerSection = page.locator("section").filter({ has: page.getByRole("heading", { name: "Peers" }) });
+  await expect(peerSection.getByRole("list").getByText("existing-peer")).toBeVisible();
+  await peerSection.getByLabel("ชื่อ peer").fill("worker-one");
+  await peerSection.getByRole("button", { name: "เพิ่ม peer" }).click();
+  await expect(peerSection.getByText("secret-worker-one", { exact: true })).toBeVisible();
+  await expect(peerSection.getByRole("list").getByText("secret-worker-one", { exact: true })).toHaveCount(0);
+  await expect(peerSection.getByRole("list").getByText("worker-one", { exact: true })).toBeVisible();
+
+  await page.getByLabel("OIDC subject").fill("researcher-1");
+  await page.getByRole("button", { name: "เพิ่มสมาชิก" }).click();
+  await expect(peerSection.getByText("secret-worker-one", { exact: true })).toHaveCount(0);
+
+  await peerSection.getByLabel("ชื่อ peer").fill("worker-two");
+  await peerSection.getByRole("button", { name: "เพิ่ม peer" }).click();
+  await expect(peerSection.getByText("secret-worker-two", { exact: true })).toBeVisible();
+  await peerSection.getByLabel("ชื่อ peer").fill("missing-secret");
+  await peerSection.getByRole("button", { name: "เพิ่ม peer" }).click();
+  await expect(peerSection.getByText("secret-worker-two", { exact: true })).toHaveCount(0);
+  await expect(page.locator("main p[role=alert]")).toContainText("API ไม่ส่ง secret");
+
+  await peerSection.getByLabel("ชื่อ peer").fill("server-error");
+  await peerSection.getByRole("button", { name: "เพิ่ม peer" }).click();
+  await expect(peerSection.getByText(/secret-/)).toHaveCount(0);
+  await expect(page.locator("main p[role=alert]")).toContainText("500");
+
+  await peerSection.getByLabel("ชื่อ peer").fill("reload-check");
+  await peerSection.getByRole("button", { name: "เพิ่ม peer" }).click();
+  await expect(peerSection.getByText("secret-reload-check", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByText("secret-reload-check", { exact: true })).toHaveCount(0);
+});

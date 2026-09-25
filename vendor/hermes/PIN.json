@@ -1,0 +1,8 @@
+{
+  "source_repository": "NousResearch/hermes-agent",
+  "source_commit": "ab1f70f4b3410fc8cd5195734f0a1b386e873de4",
+  "license": "MIT",
+  "license_file": "LICENSE.hermes",
+  "patch_file": "approval-receipts.patch",
+  "patch_sha256": "7ac171f194f73bd2ced48bcf8c89ee649a61a8483ae68baf284abe62dd0dcbac"
+}

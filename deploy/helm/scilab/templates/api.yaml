@@ -1,0 +1,170 @@
+{{- $admissionLimit := required "SCILAB_RUN_ADMISSION_PER_MINUTE is required" .Values.runAdmissionPerMinute | toString -}}
+{{- $postgresSecret := required "externalSecrets.postgres is required" .Values.externalSecrets.postgres -}}
+{{- $minioSecret := required "externalSecrets.minio is required" .Values.externalSecrets.minio -}}
+{{- $natsSecret := required "externalSecrets.nats is required" .Values.externalSecrets.nats -}}
+{{- $keycloakSecret := required "externalSecrets.keycloak is required" .Values.externalSecrets.keycloak -}}
+{{- $opaSecret := required "externalSecrets.opa is required" .Values.externalSecrets.opa -}}
+{{- $telemetrySecret := required "externalSecrets.telemetry is required" .Values.externalSecrets.telemetry -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" $admissionLimit) -}}
+{{- fail "SCILAB_RUN_ADMISSION_PER_MINUTE must be a positive integer" -}}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+---
+# Runtime fetches scilab-{lab}-hermes-api (key api_key) by name; do not grant list/watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-api
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-api
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-api
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: {{ .Values.api.port }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: scilab
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scilab
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scilab
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: api
+        scilab.ai/component: platform-gateway
+    spec:
+      serviceAccountName: {{ .Release.Name }}-api
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: {{ include "scilab.image" (dict "path" "images.api" "image" .Values.images.api) | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SCILAB_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $postgresSecret | quote }}
+                  key: SCILAB_DATABASE_URL
+            - name: SCILAB_OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $keycloakSecret | quote }}
+                  key: SCILAB_OIDC_ISSUER
+            - name: SCILAB_OIDC_AUDIENCE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $keycloakSecret | quote }}
+                  key: SCILAB_OIDC_AUDIENCE
+            - name: SCILAB_OIDC_JWKS_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $keycloakSecret | quote }}
+                  key: SCILAB_OIDC_JWKS_URI
+            - name: SCILAB_MINIO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $minioSecret | quote }}
+                  key: SCILAB_MINIO_URL
+            - name: SCILAB_MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $minioSecret | quote }}
+                  key: SCILAB_MINIO_ACCESS_KEY
+            - name: SCILAB_MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $minioSecret | quote }}
+                  key: SCILAB_MINIO_SECRET_KEY
+            - name: SCILAB_INPUT_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $minioSecret | quote }}
+                  key: SCILAB_INPUT_BUCKET
+            - name: SCILAB_ARTIFACT_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $minioSecret | quote }}
+                  key: SCILAB_ARTIFACT_BUCKET
+            - name: SCILAB_NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $natsSecret | quote }}
+                  key: SCILAB_NATS_URL
+            - name: SCILAB_OPA_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $opaSecret | quote }}
+                  key: SCILAB_OPA_URL
+            - name: SCILAB_RUN_ADMISSION_PER_MINUTE
+              value: {{ $admissionLimit | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ $telemetrySecret | quote }}

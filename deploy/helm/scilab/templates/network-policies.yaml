@@ -1,0 +1,99 @@
+{{- if not .Values.network.externalCidrs -}}
+{{- fail "network.externalCidrs must list deployment-specific external and Kubernetes API ranges" -}}
+{{- end }}
+# Only this release's application Pods are selected; unrelated namespace Pods
+# are not changed by installing the chart.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-app-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: scilab
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-worker-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      scilab.ai/component: run-service
+      scilab.ai/platform-release: {{ .Release.Name }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-app-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: scilab
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.web.port }}
+        - protocol: TCP
+          port: {{ .Values.api.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-app-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: scilab
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: scilab
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              scilab.ai/component: hermes
+      ports:
+        - protocol: TCP
+          port: 8642
+    {{- range .Values.network.externalCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-worker-egress
+spec:
+  podSelector:
+    matchLabels:
+      scilab.ai/component: run-service
+      scilab.ai/platform-release: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              scilab.ai/component: hermes
+      ports:
+        - protocol: TCP
+          port: 8642
+    {{- range .Values.network.externalCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+    {{- end }}

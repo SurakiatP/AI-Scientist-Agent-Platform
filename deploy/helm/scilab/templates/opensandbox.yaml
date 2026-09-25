@@ -11,7 +11,7 @@ data:
   sandbox.toml: |
     [runtime]
     type = "kubernetes"
-    execd_image = "opensandbox/execd:release-1.1.0"
+    execd_image = "opensandbox/execd:release-1.1.0@sha256:{{ include "scilab.digest" (dict "path" "images.openSandbox.execd" "digest" .Values.images.openSandbox.execd.digest) }}"
 
     [secure_runtime]
     type = "kata"
@@ -19,7 +19,7 @@ data:
 
     [egress]
     mode = "dns+nft"
-    image = "opensandbox/egress:release-1.1.0"
+    image = "opensandbox/egress:release-1.1.0@sha256:{{ include "scilab.digest" (dict "path" "images.openSandbox.egress" "digest" .Values.images.openSandbox.egress.digest) }}"
   sandbox-request-defaults.yaml: |
     credentialProxy:
       enabled: true
