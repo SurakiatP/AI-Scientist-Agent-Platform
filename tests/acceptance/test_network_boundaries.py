@@ -79,6 +79,24 @@ def test_optional_web_tls_ingress_routes_to_web_only() -> None:
     assert web_ingress["spec"]["tls"][0]["secretName"] == "web-tls-test"
 
 
+def test_empty_trusted_proxy_cidrs_renders_trust_none_and_prices_render_as_json() -> None:
+    documents = _render("staging", TEST_OVERRIDES)
+    deployments = {
+        document["metadata"]["name"]: document
+        for document in documents
+        if document["kind"] == "Deployment"
+    }
+    api = deployments["scilab-api"]["spec"]["template"]["spec"]["containers"][0]
+    assert api["command"][-1] == "--forwarded-allow-ips="
+    operator_env = {
+        item["name"]: item
+        for item in deployments["scilab-lab-operator"]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+    }
+    assert operator_env["SCILAB_MODEL_PRICES_THB"]["value"] == "{}"
+
+
 def _helm(*args: str) -> subprocess.CompletedProcess[str]:
     assert shutil.which("helm"), "helm is required for the chart acceptance gate"
     return subprocess.run(
@@ -180,6 +198,8 @@ def test_chart_lints_and_renders_only_secure_application_boundaries(profile: str
         "SCILAB_OIDC_ISSUER": ("scilab-keycloak-test", "SCILAB_OIDC_ISSUER"),
         "SCILAB_OIDC_AUDIENCE": ("scilab-keycloak-test", "SCILAB_OIDC_AUDIENCE"),
         "SCILAB_OIDC_JWKS_URI": ("scilab-keycloak-test", "SCILAB_OIDC_JWKS_URI"),
+        "SCILAB_KEYCLOAK_REALM_URL": ("scilab-keycloak-test", "SCILAB_KEYCLOAK_REALM_URL"),
+        "SCILAB_MCP_BASE_URL": ("scilab-keycloak-test", "SCILAB_MCP_BASE_URL"),
         "SCILAB_MINIO_URL": ("scilab-minio-test", "SCILAB_MINIO_URL"),
         "SCILAB_MINIO_ACCESS_KEY": ("scilab-minio-test", "SCILAB_MINIO_ACCESS_KEY"),
         "SCILAB_MINIO_SECRET_KEY": ("scilab-minio-test", "SCILAB_MINIO_SECRET_KEY"),
@@ -198,6 +218,17 @@ def test_chart_lints_and_renders_only_secure_application_boundaries(profile: str
             "key": key,
         }
     assert env["SCILAB_RUN_ADMISSION_PER_MINUTE"]["value"] == "7"
+    assert api["command"] == [
+        "uvicorn",
+        "scilab.api.runtime:create_runtime_app",
+        "--factory",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--proxy-headers",
+        "--forwarded-allow-ips=",
+    ]
     api_secret_refs = {
         item["secretRef"]["name"] for item in api["envFrom"]
     }
@@ -215,7 +246,19 @@ def test_chart_lints_and_renders_only_secure_application_boundaries(profile: str
         "SCILAB_RELEASE_NAME",
         "SCILAB_PI_PROVIDER",
         "SCILAB_REVIEWER_PROVIDER",
+        "SCILAB_API_PORT",
+        "SCILAB_OPENSANDBOX_PORT",
+        "SCILAB_EXTERNAL_CIDRS",
+        "SCILAB_SANDBOX_IMAGE",
+        "SCILAB_MODEL_PRICES_THB",
     }
+    assert operator_env["SCILAB_API_PORT"]["value"] == "8000"
+    assert operator_env["SCILAB_OPENSANDBOX_PORT"]["value"] == "8080"
+    assert operator_env["SCILAB_EXTERNAL_CIDRS"]["value"] == "10.33.0.0/16"
+    assert operator_env["SCILAB_SANDBOX_IMAGE"]["value"] == (
+        "opensandbox/execd:release-1.1.0@sha256:" + "d" * 64
+    )
+    assert operator_env["SCILAB_MODEL_PRICES_THB"]["value"] == "{}"
     assert operator_env["SCILAB_DATABASE_SECRET_NAME"]["value"] == (
         "scilab-postgres-test"
     )
@@ -248,6 +291,11 @@ def test_chart_lints_and_renders_only_secure_application_boundaries(profile: str
                 "SCILAB_PI_PROVIDER",
                 "SCILAB_REVIEWER_PROVIDER",
                 "SCILAB_API_ORIGIN",
+                "SCILAB_API_PORT",
+                "SCILAB_OPENSANDBOX_PORT",
+                "SCILAB_EXTERNAL_CIDRS",
+                "SCILAB_SANDBOX_IMAGE",
+                "SCILAB_MODEL_PRICES_THB",
             }
             for item in container.get("env", [])
         )

@@ -20,6 +20,7 @@ CANONICAL_REASONS = frozenset(
         "approval_rejected",
         "approval_expired",
         "budget_exhausted",
+        "manifest_seal_failed",
     }
 )
 
@@ -134,7 +135,7 @@ def apply_transition(
                 state=target,
                 reason=_require_reason(
                     reason,
-                frozenset({"run_timeout", "heartbeat_loss", "error"}),
+                frozenset({"run_timeout", "heartbeat_loss", "error", "manifest_seal_failed"}),
                     "error",
                 ),
             )

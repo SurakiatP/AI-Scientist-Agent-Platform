@@ -289,6 +289,7 @@ def test_provenance_manifest_allowed_denied_and_tamper_edge_scenarios() -> None:
             "model_aliases": {"pi": "pi-model", "child": "child-model"},
         },
         "skills_image": "skills@sha256:def", "sandbox_image": "sandbox@sha256:ghi",
+        "runtime": {"provider": "openrouter", "model": "pi-model"},
         "inputs": [{"artifact_id": "input-1", "sha256": "b" * 64, "name": "question.txt"}],
         "steps": [{"n": 1, "role": "pi", "delegation_id": "del-1", "commands_log": "log-1", "outputs": ["artifact-1"]}],
         "claims": [{"id": "claim-1", "text": "supported", "evidence": ["artifact-1"], "confidence": 0.8}],

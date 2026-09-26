@@ -6,7 +6,88 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol
 from urllib.parse import quote
 
+from scilab.redaction import redact as _redact
+
 _HERMES_DATA_EVENTS = frozenset({"approval.request", "run.completed", "run.failed"})
+_HERMES_TOOL_EVENTS = {"tool.started": "tool.started", "tool.completed": "tool.finished"}
+_HERMES_DELEGATION_EVENTS = {
+    "subagent.start": "delegation.started",
+    "subagent.complete": "delegation.finished",
+}
+
+
+def _translate_tool_or_delegation(
+    vendor_event: str, payload: Mapping[str, Any], run_id: str, event_id: str | None
+) -> dict[str, object] | None:
+    """Translate a Hermes tool/subagent SSE frame into an I2-shaped platform event.
+
+    Returns None for a malformed frame (e.g. a blank tool name), so the caller
+    falls back to the generic "message" wrapping.
+    """
+    if payload.get("run_id") != run_id:
+        raise ValueError("Hermes event run_id does not match requested run_id")
+
+    if vendor_event in _HERMES_TOOL_EVENTS:
+        tool = payload.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            return None
+        args_redacted = _redact({"preview": payload.get("preview")})
+        if vendor_event == "tool.started":
+            data = {
+                "tool": tool,
+                "args_redacted": args_redacted,
+                "duration_ms": 0,
+                "ok": True,
+                "error": None,
+            }
+        else:
+            error_flag = bool(payload.get("error"))
+            try:
+                duration_ms = round(float(payload.get("duration") or 0) * 1000)
+            except (TypeError, ValueError):
+                return None
+            data = {
+                "tool": tool,
+                "args_redacted": args_redacted,
+                "duration_ms": duration_ms,
+                "ok": not error_flag,
+                "error": None,
+            }
+        return {
+            "id": event_id,
+            "event": _HERMES_TOOL_EVENTS[vendor_event],
+            "run_id": run_id,
+            "data": data,
+        }
+
+    delegation_id = payload.get("delegation_id") or payload.get("subagent_id")
+    if not isinstance(delegation_id, str) or not delegation_id.strip():
+        return None
+    try:
+        child_count = int(payload.get("task_count") or 1)
+    except (TypeError, ValueError):
+        return None
+    data = {
+        "delegation_id": delegation_id,
+        "role": payload.get("role") or "subagent",
+        "goal": payload.get("goal") or "",
+        "child_count": child_count,
+        "schema_valid": None,
+    }
+    event: dict[str, object] = {
+        "id": event_id,
+        "event": _HERMES_DELEGATION_EVENTS[vendor_event],
+        "run_id": run_id,
+        "data": data,
+    }
+    if vendor_event == "subagent.complete":
+        event["usage"] = {
+            "model": payload.get("model"),
+            "input_tokens": payload.get("input_tokens"),
+            "output_tokens": payload.get("output_tokens"),
+            "cost_usd": payload.get("cost_usd"),
+        }
+    return event
 
 
 class HermesReceiptConflict(ValueError):
@@ -118,6 +199,15 @@ class HermesClient:
                     if event_id is not None:
                         normalized.setdefault("id", event_id)
                     return normalized
+                if (
+                    event_name in (None, "message")
+                    and isinstance(payload, dict)
+                    and isinstance(vendor_event, str)
+                    and (vendor_event in _HERMES_TOOL_EVENTS or vendor_event in _HERMES_DELEGATION_EVENTS)
+                ):
+                    translated = _translate_tool_or_delegation(vendor_event, payload, run_id, event_id)
+                    if translated is not None:
+                        return translated
                 return {
                     "id": event_id,
                     "event": event_name or "message",
@@ -292,27 +382,3 @@ class HermesClient:
         if not isinstance(message, Mapping):
             raise ValueError("Hermes completion response has no assistant message")
         return _nonblank(message.get("content"), "completion content")
-
-    async def ask_lab(
-        self,
-        lab_id: str,
-        question: str,
-        *,
-        idempotency_key: str,
-        **context: object,
-    ) -> str:
-        payload = {
-            "prompt": _nonblank(question, "question"),
-            **context,
-        }
-        return await self.start_run(
-            lab_id,
-            {
-                "input": json.dumps(
-                    payload,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-            },
-            idempotency_key=idempotency_key,
-        )

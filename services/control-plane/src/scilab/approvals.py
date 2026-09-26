@@ -12,9 +12,11 @@ from typing import Any
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from scilab.audit import AuditService
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
 from scilab.events import EventFanoutError
 from scilab.identity import Identity
+from scilab.redaction import redact as _redact
 from scilab.runs.model import Run, RunState
 from scilab.runs.service import RunNotFound, RunService
 from scilab.runs.state import apply_transition
@@ -22,12 +24,9 @@ from scilab.tenancy import require_scope
 
 
 APPROVAL_EFFECTS = frozenset(
-    {"read", "publish", "external_write", "delete", "credential_use", "network_change", "unknown"}
+    {"read", "publish", "external_write", "delete", "credential_use", "network_change", "execute", "unknown"}
 )
 _LOG = logging.getLogger(__name__)
-_SENSITIVE_KEYS = frozenset(
-    {"password", "passwd", "secret", "token", "api_key", "authorization", "credential"}
-)
 
 
 class ApprovalNotFound(LookupError):
@@ -97,23 +96,6 @@ class OPAClient:
             return json.loads(response.read()).get("result")
 
 
-def _is_sensitive(key: object) -> bool:
-    if not isinstance(key, str):
-        return False
-    lowered = key.lower()
-    return lowered in _SENSITIVE_KEYS or lowered.endswith("_token") or lowered.endswith("_secret")
-
-
-def _redact(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: "[REDACTED]" if _is_sensitive(key) else _redact(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    if isinstance(value, tuple):
-        return [_redact(item) for item in value]
-    return value
-
-
 def _text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be non-blank")
@@ -160,12 +142,14 @@ class ApprovalService:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         id_factory: Callable[[], str] = lambda: str(uuid4()),
+        audit: Any = None,
     ) -> None:
         self.connection = connection
         self.opa = opa
         self.event_service = event_service
         self.clock = clock
         self.id_factory = id_factory
+        self.audit = audit if audit is not None else AuditService(connection)
 
     @contextmanager
     def _access(self, identity: Identity, scope: str):
@@ -372,7 +356,7 @@ class ApprovalService:
 
     async def request_hermes_approval(
         self, identity: Identity, run_id: str, hermes_request_id: str,
-        preview: Mapping[str, Any],
+        preview: Mapping[str, Any], *, effect: str = "unknown",
     ) -> tuple[Approval, Run]:
         request_id = _text(hermes_request_id, "hermes_request_id")
         if len(request_id) > 256:
@@ -380,7 +364,8 @@ class ApprovalService:
         if not isinstance(preview, Mapping):
             raise ValueError("preview must be a mapping")
         safe_preview = _redact(dict(preview))
-        policy = self.evaluate_action("hermes.tool", "unknown", safe_preview)
+        normalized_effect = effect if effect in APPROVAL_EFFECTS else "unknown"
+        policy = self.evaluate_action("hermes.tool", normalized_effect, safe_preview)
         fingerprint = hashlib.sha256(
             json.dumps([identity.lab_id, run_id, request_id], separators=(",", ":")).encode()
         ).hexdigest()
@@ -401,7 +386,7 @@ class ApprovalService:
                 raise ApprovalStateError("Hermes approval requires a running Run")
             updated = apply_transition(run, RunState.AWAITING_APPROVAL, now)
             candidate = Approval(
-                self.id_factory(), run_id, identity.lab_id, "hermes.tool", "unknown",
+                self.id_factory(), run_id, identity.lab_id, "hermes.tool", normalized_effect,
                 fingerprint, "pending", policy.reason, policy.policy_rule, safe_preview,
                 now, now + timedelta(hours=24), None, None, None,
             )
@@ -521,6 +506,23 @@ class ApprovalService:
                  row["hermes_decision_note"], identity.lab_id, approval_id),
             )
             self._save_run(cursor, updated)
+            details: dict[str, Any] = {
+                "approval_id": approval.id,
+                "effect": approval.effect,
+                "policy_rule": approval.policy_rule,
+                "hermes_request_id": row["hermes_request_id"],
+            }
+            if row["hermes_decision_note"] is not None:
+                details["note"] = row["hermes_decision_note"]
+            self.audit.append_with_cursor(
+                cursor,
+                identity,
+                run_id,
+                row["hermes_decision_actor"],
+                "approval",
+                "approval.approved" if approved else "approval.rejected",
+                details,
+            )
             event = self.event_service.record_with_cursor(
                 cursor,
                 identity,
@@ -646,6 +648,22 @@ class ApprovalService:
                 (status, now, identity.principal, note, identity.lab_id, approval.id),
             )
             self._save_run(cursor, updated_run)
+            details: dict[str, Any] = {
+                "approval_id": approval.id,
+                "effect": approval.effect,
+                "policy_rule": approval.policy_rule,
+            }
+            if note is not None:
+                details["note"] = note
+            self.audit.append_with_cursor(
+                cursor,
+                identity,
+                approval.run_id,
+                identity.principal,
+                "approval",
+                "approval.approved" if status == "approved" else "approval.rejected",
+                details,
+            )
             return Approval(
                 **{
                     **approval.__dict__,
@@ -689,6 +707,22 @@ class ApprovalService:
                 )
                 if updated_run is not None:
                     self._save_run(cursor, updated_run)
+                details: dict[str, Any] = {
+                    "approval_id": approval.id,
+                    "effect": approval.effect,
+                    "policy_rule": approval.policy_rule,
+                }
+                if approval.note is not None:
+                    details["note"] = approval.note
+                self.audit.append_with_cursor(
+                    cursor,
+                    identity,
+                    approval.run_id,
+                    identity.principal,
+                    "approval",
+                    "approval.expired",
+                    details,
+                )
                 expired.append(
                     Approval(
                         **{

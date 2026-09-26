@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from scilab.contracts import RunEvent
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
 from scilab.identity import Identity
+from scilab.redaction import redact as _redact
 from scilab.runs.service import RunNotFound
 from scilab.tenancy import require_scope
 
@@ -19,16 +20,6 @@ _ULID_INDEX = {character: index for index, character in enumerate(_ULID_ALPHABET
 _ENTROPY_MASK = (1 << 80) - 1
 _TIMESTAMP_MASK = (1 << 48) - 1
 _TOOL_EVENTS = {"tool.started", "tool.progress", "tool.finished"}
-_SENSITIVE_KEYS = {
-    "password",
-    "secret",
-    "token",
-    "api_key",
-    "authorization",
-    "cookie",
-    "client_secret",
-    "private_key",
-}
 
 
 class EventBus(Protocol):
@@ -51,23 +42,6 @@ def _subject(lab_id: str, run_id: str) -> str:
         ):
             raise ValueError("NATS subject tokens must be non-blank and contain no separators")
     return f"runs.{lab_id}.{run_id}"
-
-
-def _redact(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: "[REDACTED]" if _is_sensitive_key(key) else _redact(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact(item) for item in value)
-    return value
-
-
-def _is_sensitive_key(key: object) -> bool:
-    if not isinstance(key, str):
-        return False
-    lowered = key.lower()
-    return lowered in _SENSITIVE_KEYS or lowered.endswith("_token") or lowered.endswith("_secret")
 
 
 def _event_payload(event_type: object, payload: Mapping[str, Any]) -> dict[str, Any]:

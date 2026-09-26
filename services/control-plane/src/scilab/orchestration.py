@@ -59,6 +59,14 @@ class ResearchCycle:
     def report(self) -> dict[str, Any]:
         return {
             "stage": "report",
+            "instructions": (
+                "End the report with exactly one fenced ```json code block, "
+                "as the very last content, containing an object that "
+                "validates against the research-result schema: \"claims\" "
+                "(each with text, evidence, confidence), \"artifacts\", "
+                "\"caveats\", and optional \"next_steps\"."
+            ),
+            "output_schema": ResearchResult.model_json_schema(),
             "delegations": [
                 self._delegation("Writer", "sci-specialist", self.pi_provider),
             ],

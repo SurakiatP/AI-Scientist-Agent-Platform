@@ -92,6 +92,7 @@ VALID_MANIFEST = {
         "config_sha256": "abc123",
         "model_aliases": {"pi": "sci-pi-frontier", "child": "sci-specialist"},
     },
+    "runtime": {"provider": "hermes", "model": "sci-pi-frontier"},
     "skills_image": "registry/scilab/skills:2026.09.2",
     "sandbox_image": "registry/scilab/sandbox-bio:2026.09",
     "inputs": [{"artifact_id": "art_1", "sha256": "def456", "name": "pbmc.h5ad"}],
@@ -208,6 +209,23 @@ def test_cost_event_allows_explicitly_unbudgeted_run():
     assert RunEvent.model_validate(event)
 
 
+def test_cost_event_allows_unpriced_model_with_warning():
+    payload = {**VALID_PAYLOADS["cost.updated"], "llm_cost_thb": None, "warning": "unpriced_model:x"}
+    event = {**VALID_EVENT, "type": "cost.updated", "payload": payload}
+
+    validated = RunEvent.model_validate(event)
+    assert validated.payload.llm_cost_thb is None
+    assert validated.payload.warning == "unpriced_model:x"
+
+
+def test_raw_hermes_run_completed_payload_is_rejected():
+    raw_hermes_payload = {"output": "final report text", "cost_usd": 0.12, "run_id": "run_01J8"}
+    event = {**VALID_EVENT, "type": "run.completed", "payload": raw_hermes_payload}
+
+    with pytest.raises(ValidationError):
+        RunEvent.model_validate(event)
+
+
 @pytest.mark.parametrize("event_type,payload", [("tool.progress", {"progress": 0.5}), ("run.failed", {"error": 123})])
 def test_generic_payloads_remain_json_objects(event_type, payload):
     event = {**VALID_EVENT, "type": event_type, "payload": payload}
@@ -314,3 +332,15 @@ def test_nested_unknown_fields_are_rejected():
 def test_optional_next_steps_can_be_omitted():
     result = ResearchResult.model_validate(VALID_RESULT)
     assert result.next_steps == []
+
+
+def test_manifest_cost_unpriced_models_defaults_to_empty_and_can_be_set():
+    manifest = RunManifest.model_validate(VALID_MANIFEST)
+    assert manifest.cost.unpriced_models == []
+
+    with_unpriced = {
+        **VALID_MANIFEST,
+        "cost": {**VALID_MANIFEST["cost"], "unpriced_models": ["vendor-new-model"]},
+    }
+    manifest = RunManifest.model_validate(with_unpriced)
+    assert manifest.cost.unpriced_models == ["vendor-new-model"]

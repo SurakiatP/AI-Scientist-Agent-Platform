@@ -241,6 +241,7 @@ def test_claim_is_tenant_scoped_and_sets_a_durable_lease() -> None:
     assert claim is not None
     assert claim.run.id == "run-a"
     assert claim.request_payload["options"] == {}
+    assert claim.actor == "user:researcher"
     assert claim.lease_expires_at == NOW + timedelta(seconds=api.LEASE_SECONDS)
     assert database.rows[0]["worker_claim_token"] == claim.token
     assert database.calls[0][1] == ("scilab.current_lab_id", "lab-a")
@@ -302,6 +303,20 @@ def test_expired_lease_is_reclaimed_with_a_new_fencing_token() -> None:
     assert recovered.run.id == first.run.id
     assert recovered.token != first.token
     assert recovered.lease_expires_at == database.now + timedelta(seconds=api.LEASE_SECONDS)
+
+
+def test_running_claim_with_null_payload_returns_empty_mapping_instead_of_raising() -> None:
+    run = queued_run()
+    run["state"] = "running"
+    run["hermes_run_id"] = "hermes-1"
+    run["request_payload"] = None
+    database = Database([run])
+
+    claim = worker_api().RunWorker(database).claim_next(worker_identity())
+
+    assert claim is not None
+    assert claim.request_payload == {}
+    assert claim.actor == "user:researcher"
 
 
 def test_expired_running_lease_recovers_the_existing_hermes_run() -> None:

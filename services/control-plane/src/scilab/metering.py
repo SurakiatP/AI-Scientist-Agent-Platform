@@ -35,6 +35,31 @@ def _number(value: object, field: str) -> float:
     return number
 
 
+def _optional_number(value: object, field: str) -> float | None:
+    return None if value is None else _number(value, field)
+
+
+def parse_model_prices(text: str) -> dict[str, dict[str, float]]:
+    """Parse SCILAB_MODEL_PRICES_THB-style JSON: {"model": {"in": x, "out": y}}."""
+    try:
+        data = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("model prices must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("model prices must be a JSON object")
+    prices: dict[str, dict[str, float]] = {}
+    for model, rate in data.items():
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model price keys must be non-blank strings")
+        if not isinstance(rate, Mapping) or set(rate) != {"in", "out"}:
+            raise ValueError(f"price for {model!r} must be an object with in/out")
+        prices[model] = {
+            "in": _number(rate["in"], f"{model}.in"),
+            "out": _number(rate["out"], f"{model}.out"),
+        }
+    return prices
+
+
 def _tokens(value: object) -> tuple[int, int]:
     if isinstance(value, bool):
         raise ValueError("tokens must be a non-negative integer or token mapping")
@@ -63,7 +88,7 @@ class UsageRecord:
     tokens_in: int
     tokens_out: int
     compute: float
-    llm_cost_thb: float
+    llm_cost_thb: float | None
     compute_cost_thb: float
     recorded_at: datetime
 
@@ -73,7 +98,7 @@ class UsageRecord:
 
     @property
     def cost_thb(self) -> float:
-        return self.llm_cost_thb + self.compute_cost_thb
+        return (self.llm_cost_thb or 0.0) + self.compute_cost_thb
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +134,14 @@ class MeteringService:
         run_service: Any | None = None,
         audit_service: AuditService | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        prices: Mapping[str, Mapping[str, float]] | None = None,
     ) -> None:
         self.connection = connection
         self.event_service = event_service
         self.run_service = run_service or RunService(connection, clock=clock)
         self.audit_service = audit_service or AuditService(connection, clock=clock)
         self.clock = clock
+        self.prices = prices
 
     @contextmanager
     def _access(self, identity: Identity, scope: str):
@@ -158,15 +185,20 @@ class MeteringService:
 
     def _record_usage(
         self, identity: Identity, run_id: str, actor: str, source: str,
-        tokens: object, compute: float, llm_cost_thb: float, compute_cost_thb: float,
+        tokens: object, compute: float, llm_cost_thb: float | None, compute_cost_thb: float,
+        *,
+        model: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        warning: str | None = None,
     ) -> tuple[UsageRecord, bool]:
         run_id = _text(run_id, "run_id")
         actor = _text(actor, "actor")
         source = _text(source, "source")
         tokens_in, tokens_out = _tokens(tokens)
         compute_value = _number(compute, "compute")
-        llm_cost = _number(llm_cost_thb, "llm_cost_thb")
+        llm_cost = _optional_number(llm_cost_thb, "llm_cost_thb")
         compute_cost = _number(compute_cost_thb, "compute_cost_thb")
+        metadata_value = dict(metadata) if metadata else {}
         usage_id = uuid4().hex
         recorded_at = self.clock()
 
@@ -192,11 +224,12 @@ class MeteringService:
             cursor.execute(
                 "INSERT INTO metering_usage "
                 "(usage_id, run_id, lab_id, actor, source, tokens_in, tokens_out, compute, "
-                "llm_cost_thb, compute_cost_thb, recorded_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "llm_cost_thb, compute_cost_thb, model, metadata, recorded_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     usage_id, run_id, identity.lab_id, actor, source, tokens_in, tokens_out,
-                    compute_value, llm_cost, compute_cost, recorded_at,
+                    compute_value, llm_cost, compute_cost, model,
+                    json.dumps(metadata_value, separators=(",", ":")), recorded_at,
                 ),
             )
             cursor.execute(
@@ -236,6 +269,8 @@ class MeteringService:
                 "compute_cost_thb": float(run_totals[3]),
                 "budget_remaining_thb": remaining,
             }
+            if warning is not None:
+                payload["warning"] = warning
             cursor.execute(
                 "INSERT INTO metering_event_outbox "
                 "(usage_id, run_id, lab_id, payload, created_at, delivered_at) "
@@ -276,6 +311,49 @@ class MeteringService:
             ),
             True,
         )
+
+    async def record_model_usage_async(
+        self,
+        identity: Identity,
+        run_id: str,
+        *,
+        actor: str,
+        source: str,
+        model: str,
+        tokens_in: int,
+        tokens_out: int,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> UsageRecord:
+        model_name = _text(model, "model")
+        rate = None if self.prices is None else self.prices.get(model_name)
+        warning: str | None = None
+        llm_cost_thb: float | None
+        if rate is None:
+            llm_cost_thb = None
+            warning = f"unpriced_model:{model_name}"
+        else:
+            llm_cost_thb = (
+                tokens_in / 1_000_000 * rate["in"] + tokens_out / 1_000_000 * rate["out"]
+            )
+        record, has_event = self._record_usage(
+            identity, run_id, actor, source,
+            {"tokens_in": tokens_in, "tokens_out": tokens_out}, 0.0, llm_cost_thb, 0.0,
+            model=model_name, metadata=metadata, warning=warning,
+        )
+        if has_event:
+            await self.deliver_usage_event_async(identity, record.usage_id)
+        return record
+
+    def run_token_totals(self, identity: Identity, run_id: str) -> tuple[int, int]:
+        run_id = _text(run_id, "run_id")
+        with self._access(identity, "runs:read") as cursor:
+            cursor.execute(
+                "SELECT COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) "
+                "FROM metering_usage WHERE lab_id = %s AND run_id = %s",
+                (identity.lab_id, run_id),
+            )
+            totals = cursor.fetchone() or (0, 0)
+        return int(totals[0]), int(totals[1])
 
     def deliver_usage_event(self, identity: Identity, usage_id: str) -> bool:
         pending = self._pending_event(identity, usage_id)
@@ -389,7 +467,7 @@ class MeteringService:
         if self.event_service is None:
             raise RuntimeError("cost.updated publication requires an event service")
         return self.event_service.publish_event(
-            identity, run_id, "cost.updated", payload, "metering"
+            identity, run_id, "cost.updated", payload, "run-service"
         )
 
     def _publish_event(self, identity: Identity, run_id: str, payload: dict[str, Any]) -> None:

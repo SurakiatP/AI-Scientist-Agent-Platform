@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from ipaddress import ip_address
 from typing import Any
@@ -20,6 +21,9 @@ from a2a.types import (
     AgentCard,
     InvalidParamsError,
     ListTasksResponse,
+    Message,
+    Part,
+    Role,
     Task,
     TaskPushNotificationConfig,
     TaskNotFoundError,
@@ -28,7 +32,7 @@ from a2a.types import (
     TaskStatusUpdateEvent,
     UnsupportedOperationError,
 )
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict, ParseDict
 
@@ -55,6 +59,61 @@ def state_for_run(state: str) -> str:
 async def _call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     result = function(*args, **kwargs)
     return await result if inspect.isawaitable(result) else result
+
+
+def _message_text(message: Any) -> str:
+    return "\n".join(
+        part.text if part.text else json.dumps(MessageToDict(part.data), ensure_ascii=False)
+        for part in message.parts
+        if part.text or part.HasField("data")
+    ).strip()
+
+
+def _metadata_skill(message: Any, params: Any) -> str | None:
+    for holder in (message, params):
+        skill = dict(holder.metadata).get("skill")
+        if skill:
+            return skill
+    return None
+
+
+def _metadata_budget(message: Any, params: Any | None) -> Mapping[str, Any]:
+    for holder in (message, params):
+        if holder is None:
+            continue
+        metadata = dict(holder.metadata)
+        if "budget_thb" in metadata:
+            return metadata
+    return {}
+
+
+def _validate_a2a_budget(
+    metadata: Mapping[str, Any]
+) -> tuple[float | None, int | None, dict[str, Any] | None]:
+    """Mirror RunSubmissionAdapter's REST budget validation (api/run_adapters.py).
+
+    Unlike REST, an A2A budget is optional: absent metadata means no per-Run
+    cap (Lab budget still applies) rather than an invented default THB.
+    """
+    if "budget_thb" not in metadata:
+        return None, None, None
+    amount = metadata.get("budget_thb")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise InvalidParamsError("budget_thb must be non-negative")
+    amount = float(amount)
+    if not math.isfinite(amount) or amount < 0:
+        raise InvalidParamsError("budget_thb must be non-negative")
+    minutes = metadata.get("max_minutes", 120)
+    if (
+        isinstance(minutes, bool)
+        or not isinstance(minutes, (int, float))
+        or not math.isfinite(minutes)
+        or minutes != int(minutes)
+        or int(minutes) <= 0
+    ):
+        raise InvalidParamsError("max_minutes must be a positive integer")
+    minutes = int(minutes)
+    return amount, minutes, {"thb": amount, "max_minutes": minutes}
 
 
 def _task(run: Any, context_id: str | None = None) -> Task:
@@ -184,55 +243,47 @@ class PushConfigStore:
 
 
 class A2ARunSubmission:
-    """Bind an A2A message to the canonical Run and its Hermes session."""
+    """Enqueue an A2A message as a canonical Run; the worker starts Hermes."""
 
-    def __init__(
-        self,
-        runs: Any,
-        cycle_for_lab: Callable[[str], Any],
-        *,
-        admission: Any | None = None,
-        events: Any | None = None,
-    ) -> None:
+    def __init__(self, runs: Any, *, admission: Any | None = None) -> None:
         self.runs = runs
-        self.cycle_for_lab = cycle_for_lab
         self.admission = admission
-        self.events = events
 
-    async def create(self, identity: Identity, message: Any, context_id: str) -> Any:
+    async def create(
+        self, identity: Identity, message: Any, context_id: str, params: Any | None = None
+    ) -> Any:
         require_scope(identity, "runs:write")
         if not context_id or not context_id.strip():
             raise ValueError("contextId required")
-        goal = "\n".join(
-            part.text if part.text else json.dumps(MessageToDict(part.data), ensure_ascii=False)
-            for part in message.parts
-            if part.text or part.HasField("data")
-        ).strip()
+        goal = _message_text(message)
         if not goal:
             raise InvalidParamsError("A2A message needs text or JSON content")
         key = message.message_id or str(uuid4())
-        cycle = self.cycle_for_lab(identity.lab_id)
-        require_lab(identity, cycle.lab_id)
-        if self.admission is None or self.events is None:
-            raise RuntimeError("A2A admission and event services are required")
+        if self.admission is None:
+            raise RuntimeError("A2A admission service is required")
+        budget_thb, max_minutes, budget_payload = _validate_a2a_budget(
+            _metadata_budget(message, params)
+        )
         await _call(self.admission.check, identity, MessageToDict(message), key)
-        run = await _call(self.runs.create, identity, key, context_id=context_id)
+        create_kwargs: dict[str, Any] = {
+            "context_id": context_id,
+            "request_payload": {
+                "goal": goal,
+                "inputs": [],
+                "skill_packs": [],
+                "budget": budget_payload,
+                "options": {},
+                "channel": "a2a",
+            },
+            "actor": identity.principal,
+        }
+        if budget_thb is not None:
+            create_kwargs["budget_thb"] = budget_thb
+            create_kwargs["max_minutes"] = max_minutes
+        run = await _call(self.runs.create, identity, key, **create_kwargs)
         if run.context_id != context_id:
             raise ValueError("messageId already belongs to a different contextId")
-        if run.hermes_run_id:
-            return run
-        hermes_run_id = await _call(
-            cycle.run, goal, idempotency_key=key, session_key=context_id
-        )
-        updated = await _call(
-            self.runs.transition, identity, run.id, "running", hermes_run_id=hermes_run_id
-        )
-        await _call(
-            self.events.publish_event, identity, run.id, "run.state",
-            {"from": str(run.state), "to": str(updated.state), "reason": updated.reason or ""},
-            "run-service",
-        )
-        return updated
+        return run
 
 
 class _ContextBuilder(DefaultServerCallContextBuilder):
@@ -255,11 +306,27 @@ class _Handler(RequestHandler):
         require_scope(identity, scope)
         return identity
 
-    async def on_message_send(self, params: Any, context: ServerCallContext) -> Task:
+    async def on_message_send(self, params: Any, context: ServerCallContext) -> Task | Message:
         identity = self._identity(context, "runs:write")
         message = params.message
+        if _metadata_skill(message, params) == "ask_lab":
+            try:
+                require_scope(identity, "artifacts:read")
+            except AuthorizationError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            answer = await _call(
+                self.services.ask.ask, identity, {"question": _message_text(message)}
+            )
+            return Message(
+                message_id=str(uuid4()),
+                context_id=message.context_id or str(uuid4()),
+                role=Role.ROLE_AGENT,
+                parts=[Part(text=answer["answer"])],
+            )
         context_id = message.context_id or str(uuid4())
-        run = await _call(self.services.run_submission.create, identity, message, context_id)
+        run = await _call(
+            self.services.run_submission.create, identity, message, context_id, params
+        )
         return _task(run, context_id)
 
     async def on_get_task(self, params: Any, context: ServerCallContext) -> Task:
@@ -279,10 +346,6 @@ class _Handler(RequestHandler):
         try:
             self._identity(context, "runs:read")
             run = await _call(self.services.runs.get, identity, params.id)
-            if run.hermes_run_id:
-                cycle = self.services.run_submission.cycle_for_lab(identity.lab_id)
-                require_lab(identity, cycle.lab_id)
-                await _call(cycle.client.stop, identity.lab_id, run.hermes_run_id)
             stopped = await _call(self.services.runs.stop, identity, params.id)
             await _call(
                 self.services.events.publish_event, identity, params.id, "run.state",
@@ -318,6 +381,8 @@ class _Handler(RequestHandler):
     ) -> AsyncIterator[TaskStatusUpdateEvent]:
         identity = self._identity(context, "runs:read")
         task = await self.on_message_send(params, context)
+        if isinstance(task, Message):
+            return
         async for update in self._updates(identity, task.id, task.context_id):
             yield update
 
@@ -351,29 +416,48 @@ class _Handler(RequestHandler):
         raise UnsupportedOperationError
 
 
+def bind_push_dispatcher(events: Any, dispatcher: PushDispatcher) -> None:
+    """Wire a persisted PushDispatcher to the event service.
+
+    ponytail: unused this wave (Q20: no per-peer push secret storage yet);
+    call this once that lands instead of wiring push_notification at construction.
+    """
+    events.push_notification = dispatcher.dispatch
+
+
 def create_app(
     services: Any,
     peers: Iterable[Mapping[str, Any]] | Callable[[str], Any],
-    lab_cards: Mapping[str, Mapping[str, Any]],
+    lab_cards: Mapping[str, Mapping[str, Any]] | Callable[[str], Any],
     *,
     event_streamer: Callable[..., Any] = stream_events,
-    push_dispatcher: PushDispatcher | None = None,
 ) -> FastAPI:
     app = FastAPI(title="SciLab A2A", version="1.0")
     peer_records = tuple(peers) if not callable(peers) else None
-    if push_dispatcher is not None:
-        services.events.push_notification = push_dispatcher.dispatch
+
+    async def _card_for(lab: str) -> Mapping[str, Any] | None:
+        if callable(lab_cards):
+            return await _call(lab_cards, lab)
+        return lab_cards.get(lab)
+
+    def _relative_path(request: Request) -> str:
+        root_path = request.scope.get("root_path", "")
+        path = request.url.path
+        if root_path and path.startswith(root_path):
+            path = path[len(root_path):] or "/"
+        return path
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next: Callable[..., Any]) -> Any:
-        if not request.url.path.startswith("/labs/"):
+        path = _relative_path(request)
+        if not path.startswith("/labs/"):
             return await call_next(request)
         if request.url.scheme != "https":
             return JSONResponse({"detail": "TLS required"}, status_code=403)
-        lab = request.url.path.split("/", 3)[2]
-        if lab not in lab_cards:
+        lab = path.split("/", 3)[2]
+        if await _card_for(lab) is None:
             return JSONResponse({"detail": "Lab not found"}, status_code=404)
-        if request.url.path.endswith("/.well-known/agent-card.json"):
+        if path.endswith("/.well-known/agent-card.json"):
             return await call_next(request)
         authorization = request.headers.get("Authorization", "")
         if not authorization.startswith("Bearer "):
@@ -414,7 +498,9 @@ def create_app(
 
     @app.get("/labs/{lab}/.well-known/agent-card.json")
     async def agent_card(lab: str, request: Request) -> dict[str, Any]:
-        card = lab_cards[lab]
+        card = await _card_for(lab)
+        if card is None:
+            raise HTTPException(status_code=404, detail="Lab not found")
         url = str(request.base_url).rstrip("/") + f"/labs/{lab}"
         v1_card = {
             "name": card["name"],
@@ -435,7 +521,7 @@ def create_app(
             "defaultOutputModes": ["text/plain", "text/markdown", "application/json"],
             "skills": list(card.get("skills", [
                 {"id": "research_task", "name": "Run research task", "tags": ["research"]},
-                {"id": "ask_lab", "name": "Ask lab", "tags": ["qa"]},
+                {"id": "ask_lab", "name": "Ask lab", "tags": ["qa", "requires:artifacts:read"]},
                 {"id": "literature_review", "name": "Literature review", "tags": ["literature"]},
             ])),
         }

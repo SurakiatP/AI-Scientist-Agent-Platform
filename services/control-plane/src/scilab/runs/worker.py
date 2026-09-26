@@ -17,6 +17,7 @@ from scilab.tenancy import require_lab, require_scope
 
 LEASE_SECONDS = 90
 _CLAIM_COLUMNS = RunService._columns + (
+    "actor",
     "request_payload",
     "worker_claim_token",
     "worker_lease_expires_at",
@@ -30,6 +31,7 @@ class RunClaim:
     request_payload: Mapping[str, Any]
     token: UUID
     lease_expires_at: datetime
+    actor: str | None = None
 
 
 class RunWorker:
@@ -91,6 +93,10 @@ class RunWorker:
                 payload = values["request_payload"]
                 if isinstance(payload, (str, bytes, bytearray)):
                     payload = json.loads(payload)
+                if payload is None:
+                    # Only a running Run (A2A/MCP-enqueued) may have no stored
+                    # request_payload; treat it as an empty options mapping.
+                    payload = {}
                 if not isinstance(payload, Mapping):
                     raise RuntimeError("queued Run request_payload must be an object")
                 return RunClaim(
@@ -98,6 +104,7 @@ class RunWorker:
                     request_payload=dict(payload),
                     token=values["worker_claim_token"],
                     lease_expires_at=values["worker_lease_expires_at"],
+                    actor=values["actor"],
                 )
 
     def renew(self, identity: Identity, claim: RunClaim) -> datetime | None:

@@ -10,39 +10,8 @@ from uuid import uuid4
 
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
 from scilab.identity import Identity
-from scilab.tenancy import require_scope
-
-
-_SENSITIVE_KEYS = {
-    "password",
-    "secret",
-    "token",
-    "api_key",
-    "authorization",
-    "cookie",
-    "client_secret",
-    "private_key",
-}
-
-
-def _is_sensitive_key(key: object) -> bool:
-    if not isinstance(key, str):
-        return False
-    lowered = key.lower()
-    return lowered in _SENSITIVE_KEYS or lowered.endswith("_token") or lowered.endswith("_secret")
-
-
-def redact_sensitive(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            key: "[REDACTED]" if _is_sensitive_key(key) else redact_sensitive(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_sensitive(item) for item in value]
-    if isinstance(value, tuple):
-        return [redact_sensitive(item) for item in value]
-    return value
+from scilab.redaction import redact as redact_sensitive
+from scilab.tenancy import AuthorizationError, require_scope
 
 
 def _text(value: object, field: str) -> str:
@@ -107,7 +76,8 @@ class AuditService:
         action: str,
         details: Mapping[str, Any],
     ) -> AuditRecord:
-        require_scope(identity, "runs:write")
+        if "runs:write" not in identity.scopes and "runs:approve" not in identity.scopes:
+            raise AuthorizationError("missing scope: runs:write or runs:approve")
         _text(run_id, "run_id")
         _text(actor, "actor")
         _text(source, "source")

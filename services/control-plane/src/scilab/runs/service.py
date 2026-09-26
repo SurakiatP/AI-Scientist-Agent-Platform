@@ -323,6 +323,41 @@ class RunService:
             )
             return [self._from_row(row) for row in cursor.fetchall()]
 
+    def list_active(self, identity: Identity) -> list[Run]:
+        """Queued and running Runs for the lease-timeout reconciliation loop."""
+        with self._access(identity, "runs:read") as cursor:
+            cursor.execute(
+                f"SELECT {self._select} FROM runs "
+                "WHERE lab_id = %s AND state IN (%s, %s) "
+                "ORDER BY created_at DESC, id DESC",
+                (identity.lab_id, RunState.QUEUED.value, RunState.RUNNING.value),
+            )
+            return [self._from_row(row) for row in cursor.fetchall()]
+
+    def lease_expires_at(self, identity: Identity, run_id: str) -> datetime | None:
+        """Claim lease expiry for one Run, or ``None`` if no worker holds it.
+
+        Used by the reconcile loop (Q25) to gate ``heartbeat_loss`` on an
+        actually expired worker claim instead of a merely stale heartbeat: an
+        unclaimed Run (e.g. resumed after approval, waiting for the single
+        per-Lab worker) must keep waiting rather than being failed.
+        """
+        with self._access(identity, "runs:read") as cursor:
+            cursor.execute(
+                "SELECT worker_claim_token, worker_lease_expires_at FROM runs "
+                "WHERE lab_id = %s AND id = %s",
+                (identity.lab_id, run_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            token, lease_expires_at = (
+                (row["worker_claim_token"], row["worker_lease_expires_at"])
+                if isinstance(row, Mapping)
+                else (row[0], row[1])
+            )
+            return lease_expires_at if token is not None else None
+
     def search_submissions(
         self,
         identity: Identity,

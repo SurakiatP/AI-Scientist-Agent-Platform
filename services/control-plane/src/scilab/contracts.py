@@ -92,9 +92,10 @@ class ArtifactPayload(StrictModel):
 class CostPayload(StrictModel):
     tokens_in: int
     tokens_out: int
-    llm_cost_thb: float
+    llm_cost_thb: float | None
     compute_cost_thb: float
     budget_remaining_thb: float | None
+    warning: str | None = None
 
 
 class CompletedPayload(StrictModel):
@@ -210,6 +211,12 @@ class ManifestCost(StrictModel):
     tokens_out: int
     llm_thb: float
     compute_thb: float
+    unpriced_models: list[str] = Field(default_factory=list)
+
+
+class ManifestRuntime(StrictModel):
+    provider: str
+    model: str
 
 
 class RunManifest(StrictModel):
@@ -220,6 +227,7 @@ class RunManifest(StrictModel):
     goal: str
     skill_packs: list[str]
     hermes: HermesManifest
+    runtime: ManifestRuntime
     skills_image: str
     sandbox_image: str
     inputs: list[ManifestInput]

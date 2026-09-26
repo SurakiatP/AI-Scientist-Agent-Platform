@@ -114,3 +114,14 @@ def test_critique_ceiling_is_two_rounds() -> None:
     cycle = research_cycle(FakeHermesClient())
 
     assert cycle.critique(rounds=4)["max_rounds"] == 2
+
+
+def test_report_stage_requires_trailing_claims_json_block() -> None:
+    request = research_cycle(FakeHermesClient()).request("Investigate the question.")
+    stages = json.loads(request["input"])["stages"]
+    report_stage = stages[-1]
+
+    assert report_stage["stage"] == "report"
+    assert "claims" in report_stage["instructions"]
+    assert "```json" in report_stage["instructions"]
+    assert report_stage["output_schema"] == ResearchResult.model_json_schema()

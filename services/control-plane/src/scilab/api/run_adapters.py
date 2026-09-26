@@ -60,6 +60,7 @@ class RunSubmissionAdapter:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise HTTPException(status_code=422, detail="Idempotency-Key is required")
         request = self._request(identity, payload)
+        request["channel"] = "web" if identity.principal.startswith("user:") else "rest"
         try:
             run = self.runs.create(
                 identity,
@@ -192,6 +193,7 @@ class RunSearchAdapter:
             if not isinstance(payload, Mapping):
                 raise RuntimeError("stored Run request payload is not an object")
             item.update(payload)
+            item.pop("channel", None)
         item["actor"] = record.get("actor")
         return item
 

@@ -18,13 +18,12 @@ from scilab.events import EventService
 from scilab.identity import Identity
 from scilab.lab_knowledge import LabKnowledgeService
 from scilab.metering import MeteringService
-from scilab.orchestration import ResearchCycle
 from scilab.provenance import ManifestService
 from scilab.research_inputs import validate_research_inputs
 from scilab.runs.model import RunState
 from scilab.runs.service import RunService
 from scilab.skill_catalog import get_skill_pack
-from scilab.tenancy import require_lab, require_scope
+from scilab.tenancy import require_scope
 
 
 async def _call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -43,7 +42,6 @@ class MCPServices:
         artifacts: ArtifactService,
         manifests: ManifestService,
         admission: Any,
-        cycle_for_lab: Callable[[str], ResearchCycle],
         knowledge: LabKnowledgeService,
     ) -> None:
         self.runs = runs
@@ -53,7 +51,6 @@ class MCPServices:
         self.artifacts = artifacts
         self.manifests = manifests
         self.admission = admission
-        self.cycle_for_lab = cycle_for_lab
         self.knowledge = knowledge
 
     async def start_research(
@@ -103,44 +100,28 @@ class MCPServices:
         ):
             raise ValueError("budget_thb must be a finite non-negative number")
 
-        cycle = self.cycle_for_lab(identity.lab_id)
-        require_lab(identity, cycle.lab_id)
         await _call(self.admission.check, identity, request, idempotency_key)
-        create_kwargs = {} if max_minutes is None else {"max_minutes": max_minutes}
+        request_payload = {
+            "goal": goal,
+            "inputs": list(inputs),
+            "skill_packs": list(skill_packs) if skill_packs is not None else [],
+            "budget": {"thb": budget_thb, "max_minutes": max_minutes},
+            "options": {},
+            "channel": "mcp",
+        }
+        create_kwargs: dict[str, Any] = {
+            "request_payload": request_payload,
+            "actor": identity.principal,
+        }
+        if max_minutes is not None:
+            create_kwargs["max_minutes"] = max_minutes
         if budget_thb is not None:
             create_kwargs["budget_thb"] = budget_thb
+        # ENQUEUE only: the worker starts Hermes off the queued Run (Q22).
         run = await _call(
             self.runs.create, identity, idempotency_key, **create_kwargs
         )
-        if run.hermes_run_id:
-            return {"run_id": run.id, "state": str(run.state)}
-
-        cycle_kwargs: dict[str, Any] = {"idempotency_key": idempotency_key}
-        if inputs:
-            cycle_kwargs["inputs"] = inputs
-        if skill_packs:
-            cycle_kwargs["skill_packs"] = skill_packs
-        hermes_run_id = await _call(cycle.run, goal, **cycle_kwargs)
-        updated = await _call(
-            self.runs.transition,
-            identity,
-            run.id,
-            "running",
-            hermes_run_id=hermes_run_id,
-        )
-        await _call(
-            self.events.publish_event,
-            identity,
-            run.id,
-            "run.state",
-            {
-                "from": str(run.state),
-                "to": str(updated.state),
-                "reason": updated.reason or "",
-            },
-            "run-service",
-        )
-        return {"run_id": updated.id, "state": str(updated.state)}
+        return {"run_id": run.id, "state": str(run.state)}
 
     def get_run(self, identity: Identity, run_id: str) -> dict[str, Any]:
         run = self.runs.get(identity, run_id)
@@ -219,7 +200,7 @@ class MCPServices:
         require_scope(identity, "artifacts:read")
         return await _call(self.knowledge.ask, identity, question)
 
-    def approve(
+    async def approve(
         self,
         identity: Identity,
         run_id: str,
@@ -227,7 +208,8 @@ class MCPServices:
         decision: str,
         note: str | None = None,
     ) -> dict[str, Any]:
-        self.approvals.decide_approval(
+        await _call(
+            self.approvals.decide_approval,
             identity,
             approval_id,
             decision,

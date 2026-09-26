@@ -118,6 +118,18 @@ def test_budget_exhaustion_cancels_but_does_not_fail():
     with pytest.raises(RunStateError):
         apply_transition(run, RunState.FAILED, NOW, reason="budget_exhausted")
 
+def test_manifest_seal_failed_allowed_running_to_failed_only():
+    run = make_run(RunState.RUNNING, running_since=NOW, last_heartbeat_at=NOW)
+
+    failed = apply_transition(run, RunState.FAILED, NOW, reason="manifest_seal_failed")
+
+    assert failed.state is RunState.FAILED
+    assert failed.reason == "manifest_seal_failed"
+
+    with pytest.raises(RunStateError):
+        apply_transition(make_run(), RunState.FAILED, NOW, reason="manifest_seal_failed")
+
+
 def test_approval_resume_does_not_add_initial_dispatch_requirement():
     run = replace(make_run(RunState.AWAITING_APPROVAL), hermes_run_id=None)
 

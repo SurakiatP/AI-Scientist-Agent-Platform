@@ -9,11 +9,12 @@ Seal a complete, contract-valid record of the Run inputs, delegated steps, claim
 
 ## Contract
 
-- A `RunManifest` contains `run_id`, `lab_id`, `actor`, `source`, `goal`, `skill_packs`, `hermes`, `skills_image`, `sandbox_image`, `inputs`, `steps`, `claims`, `cost`, `sealed_at`, and `manifest_sha256`.
-- `source` is one of `web`, `rest`, `a2a`, or `mcp`. Hermes records `image`, `config_sha256`, and `model_aliases` with `pi` and `child`.
+- A `RunManifest` contains `run_id`, `lab_id`, `actor`, `source`, `goal`, `skill_packs`, `hermes`, `runtime`, `skills_image`, `sandbox_image`, `inputs`, `steps`, `claims`, `cost`, `sealed_at`, and `manifest_sha256`.
+- `source` is one of `web`, `rest`, `a2a`, or `mcp`. Hermes records `image`, `config_sha256`, and `model_aliases` with `pi` and `child`. `runtime` records the executing `provider` and `model`.
 - Each input has `artifact_id`, `sha256`, and `name`; each step has `n`, `role`, `delegation_id`, `commands_log`, and `outputs`.
 - Each claim has `id`, `text`, `evidence`, and confidence from 0 to 1. Every delivered claim must point to evidence.
 - Record `tokens_in`, `tokens_out`, `llm_thb`, and `compute_thb`; seal only after validation and retain `sealed_at` plus `manifest_sha256`.
+- Manifest claims are extracted from the Run's final report, which must end with a JSON claims block matching `contracts/delegation/research-result.schema.json`; a missing or invalid block gets one schema-repair round before the Run fails with reason `manifest_seal_failed`.
 
 ## Scenario proof
 

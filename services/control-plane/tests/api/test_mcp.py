@@ -34,7 +34,7 @@ async def _mcp_client(app: Any, token: str) -> Any:
         )
 
     transport = StreamableHttpTransport(
-        "http://mcp.test/mcp",
+        "http://mcp.test/",
         auth=token,
         httpx_client_factory=httpx_client_factory,
     )

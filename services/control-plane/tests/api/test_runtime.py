@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import os
 import subprocess
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
@@ -15,8 +15,9 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from scilab.api import credentials_admin
 from scilab.artifacts import Artifact
-from scilab.identity import Identity
+from scilab.identity import Identity, credential_digest
 
 
 def test_container_loads_general_research_skill_pack() -> None:
@@ -50,7 +51,12 @@ def _config() -> dict[str, str]:
         "SCILAB_OPA_URL": "http://opa.example:8181",
         "SCILAB_RUN_ADMISSION_PER_MINUTE": "7",
         "POD_NAMESPACE": "scilab",
+        "SCILAB_KEYCLOAK_REALM_URL": "https://id.example/realms/scilab",
+        "SCILAB_MCP_BASE_URL": "https://mcp.example",
     }
+
+
+_PEER_SECRET = "peer-secret-for-tests"
 
 
 def test_runtime_fails_closed_without_database_configuration() -> None:
@@ -102,6 +108,13 @@ class _Database:
                 {"subject": "subject-1", "lab_id": "lab-a", "role": "owner"}
                 if params == ("subject-1", "lab-a") else None
             )
+        elif "FROM a2a_peers" in sql:
+            self.row = (
+                ("peer-a", "lab-a", ["runs:read", "runs:write"], params[0])
+                if params[0] == credential_digest(_PEER_SECRET) else None
+            )
+        elif "FROM labs" in sql:
+            self.row = ("Lab A",) if params[0] == "lab-a" else None
         elif sql.strip() == "SELECT 1":
             self.row = (1,)
         else:
@@ -114,9 +127,9 @@ class _Database:
         self.closed = True
 
 
-@pytest.fixture
-def running_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    runtime = import_module("scilab.api.runtime")
+def _patch_runtime_dependencies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime: object
+) -> tuple[_Database, str]:
     database = _Database()
     monkeypatch.setattr("psycopg.connect", lambda *_args, **_kwargs: database)
 
@@ -174,6 +187,13 @@ def running_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         signing_key,
         algorithm="RS256",
     )
+    return database, token
+
+
+@pytest.fixture
+def running_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    runtime = import_module("scilab.api.runtime")
+    database, token = _patch_runtime_dependencies(monkeypatch, tmp_path, runtime)
     with TestClient(runtime.create_runtime_app(_config())) as client:
         yield client, token
     assert database.closed
@@ -253,3 +273,83 @@ def test_runtime_wires_approval_delivery(running_runtime: tuple[TestClient, str]
     route = next(route for route in client.app.routes if route.path == "/v1/runs/{id}/approvals/{approval_id}")
     closure = dict(zip(route.endpoint.__code__.co_freevars, (cell.cell_contents for cell in route.endpoint.__closure__)))
     assert isinstance(closure["services"].approvals, HermesApprovalDelivery)
+
+
+def _a2a_request(app: object, method: str, path: str, **kwargs: object) -> httpx.Response:
+    base_url = kwargs.pop("base_url", "https://testserver")
+    if method == "POST" and path.startswith("/a2a/labs/"):
+        kwargs["headers"] = {"A2A-Version": "1.0", **kwargs.get("headers", {})}
+
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=base_url
+        ) as client:
+            return await client.request(method, path, **kwargs)
+
+    return asyncio.run(send())
+
+
+def test_a2a_agent_card_is_served_from_the_labs_lookup(running_runtime: tuple[TestClient, str]) -> None:
+    client, _ = running_runtime
+    response = _a2a_request(client.app, "GET", "/a2a/labs/lab-a/.well-known/agent-card.json")
+    assert response.status_code == 200
+    assert response.json()["name"] == "Lab A"
+
+
+def test_a2a_message_without_bearer_is_rejected(running_runtime: tuple[TestClient, str]) -> None:
+    client, _ = running_runtime
+    body = {"jsonrpc": "2.0", "id": "get-1", "method": "GetTask", "params": {"id": "run-1"}}
+    response = _a2a_request(client.app, "POST", "/a2a/labs/lab-a", json=body)
+    assert response.status_code == 401
+
+
+def test_a2a_bearer_invokes_the_peer_admin_lookup(
+    running_runtime: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = running_runtime
+    calls: list[str] = []
+    original = credentials_admin.A2APeerAdminService.lookup
+
+    def spy(self: object, secret: str) -> object:
+        calls.append(secret)
+        return original(self, secret)
+
+    monkeypatch.setattr(credentials_admin.A2APeerAdminService, "lookup", spy)
+    body = {"jsonrpc": "2.0", "id": "get-1", "method": "GetTask", "params": {"id": "run-1"}}
+
+    response = _a2a_request(
+        client.app,
+        "POST",
+        "/a2a/labs/lab-a",
+        json=body,
+        headers={"Authorization": f"Bearer {_PEER_SECRET}"},
+    )
+
+    assert calls == [_PEER_SECRET]
+    assert response.status_code != 401
+
+
+def test_mcp_is_mounted_and_requires_a_token(running_runtime: tuple[TestClient, str]) -> None:
+    client, _ = running_runtime
+    assert client.get("/mcp/").status_code == 401
+
+
+def test_mcp_lifespan_is_entered_during_runtime_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = import_module("scilab.api.runtime")
+    _patch_runtime_dependencies(monkeypatch, tmp_path, runtime)
+    entered: list[str] = []
+
+    @asynccontextmanager
+    async def fake_lifespan_context(_app: object):
+        entered.append("start")
+        yield
+        entered.append("stop")
+
+    fake_mcp_app = SimpleNamespace(router=SimpleNamespace(lifespan_context=fake_lifespan_context))
+    monkeypatch.setattr(runtime.mcp, "create_app", lambda *_args, **_kwargs: fake_mcp_app)
+
+    with TestClient(runtime.create_runtime_app(_config())):
+        assert entered == ["start"]
+    assert entered == ["start", "stop"]

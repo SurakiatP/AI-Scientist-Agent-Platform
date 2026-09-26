@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from contextlib import contextmanager
@@ -10,8 +11,9 @@ from typing import Any
 import pytest
 
 from scilab.audit import AuditService, redact_sensitive
+from scilab.contracts import RunEvent
 from scilab.identity import Identity
-from scilab.metering import MeteringService
+from scilab.metering import MeteringService, parse_model_prices
 from scilab.runs.state import RunStateError
 from scilab.telemetry import (
     correlation_context,
@@ -80,9 +82,12 @@ class Cursor:
         elif compact.startswith("insert into metering_usage"):
             columns = (
                 "usage_id", "run_id", "lab_id", "actor", "source", "tokens_in",
-                "tokens_out", "compute", "llm_cost_thb", "compute_cost_thb", "recorded_at",
+                "tokens_out", "compute", "llm_cost_thb", "compute_cost_thb", "model",
+                "metadata", "recorded_at",
             )
-            self.database.usage.append(dict(zip(columns, params, strict=True)))
+            row = dict(zip(columns, params, strict=True))
+            row["metadata"] = json.loads(row["metadata"])
+            self.database.usage.append(row)
             self.rowcount = 1
         elif compact.startswith(
             "select usage_id, run_id, lab_id, actor, source, tokens_in, tokens_out"
@@ -95,27 +100,39 @@ class Cursor:
             self.result = [tuple(row[column] for column in columns) for row in rows]
         elif compact.startswith("select coalesce(sum(tokens_in)"):
             rows = self._usage_rows(compact, params)
+            priced_llm_cost = sum(
+                row["llm_cost_thb"] for row in rows if row["llm_cost_thb"] is not None
+            )
             if "sum(compute)" in compact:
                 self.result = [(
                     sum(row["tokens_in"] for row in rows),
                     sum(row["tokens_out"] for row in rows),
                     sum(row["compute"] for row in rows),
-                    sum(row["llm_cost_thb"] for row in rows),
+                    priced_llm_cost,
+                    sum(row["compute_cost_thb"] for row in rows),
+                )]
+            elif "sum(llm_cost_thb)" in compact:
+                self.result = [(
+                    sum(row["tokens_in"] for row in rows),
+                    sum(row["tokens_out"] for row in rows),
+                    priced_llm_cost,
                     sum(row["compute_cost_thb"] for row in rows),
                 )]
             else:
                 self.result = [(
                     sum(row["tokens_in"] for row in rows),
                     sum(row["tokens_out"] for row in rows),
-                    sum(row["llm_cost_thb"] for row in rows),
-                    sum(row["compute_cost_thb"] for row in rows),
                 )]
         elif compact.startswith(
             "select coalesce(sum(llm_cost_thb + compute_cost_thb)"
         ):
             rows = [row for row in self.database.usage if row["lab_id"] == params[0]]
             self.result = [(
-                sum(row["llm_cost_thb"] + row["compute_cost_thb"] for row in rows),
+                sum(
+                    row["llm_cost_thb"] + row["compute_cost_thb"]
+                    for row in rows
+                    if row["llm_cost_thb"] is not None
+                ),
             )]
         elif compact.startswith("insert into audit_events"):
             columns = (
@@ -447,6 +464,116 @@ def test_budget_check_locks_budget_row_and_serializes_concurrent_usage() -> None
         and sql.endswith("for update")
         for sql, _ in database.calls
     )
+
+
+def test_record_model_usage_priced_computes_thb_and_publishes_run_service_source() -> None:
+    database = Database()
+    events = EventSink(database)
+    meter = MeteringService(
+        database, event_service=events, clock=lambda: NOW,
+        prices={"gpt-x": {"in": 10.0, "out": 30.0}},
+    )
+
+    record = asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="gpt-x",
+        tokens_in=1_000_000, tokens_out=500_000, metadata={"cost_usd": 0.5},
+    ))
+
+    assert record.llm_cost_thb == 25.0
+    assert record.compute_cost_thb == 0.0
+    assert record.compute == 0.0
+    assert database.usage[-1]["model"] == "gpt-x"
+    assert database.usage[-1]["metadata"] == {"cost_usd": 0.5}
+    assert database.runs[("lab-a", "run-1")]["state"] == "running"
+
+    assert len(events.events) == 1
+    identity_arg, run_id, event_type, payload, source = events.events[0]
+    assert (run_id, event_type, source) == ("run-1", "cost.updated", "run-service")
+    assert "warning" not in payload
+    assert meter.run_token_totals(identity(), "run-1") == (1_000_000, 500_000)
+
+
+def test_record_model_usage_unpriced_model_warns_and_does_not_cancel_run() -> None:
+    database = Database()
+    events = EventSink(database)
+    meter = MeteringService(database, event_service=events, clock=lambda: NOW, prices={})
+
+    record = asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="mystery-model",
+        tokens_in=100, tokens_out=50,
+    ))
+
+    assert record.llm_cost_thb is None
+    assert record.cost_thb == 0.0
+    assert database.runs[("lab-a", "run-1")]["state"] == "running"
+    payload = events.events[-1][3]
+    assert payload["warning"] == "unpriced_model:mystery-model"
+
+
+def test_cost_updated_payload_from_unpriced_usage_validates_as_run_event() -> None:
+    database = Database()
+    events = EventSink(database)
+    meter = MeteringService(database, event_service=events, clock=lambda: NOW, prices={})
+
+    asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="mystery-model",
+        tokens_in=100, tokens_out=50,
+    ))
+
+    _, run_id, event_type, payload, source = events.events[-1]
+    event = RunEvent.model_validate({
+        "event_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "run_id": run_id,
+        "lab_id": "lab-a",
+        "ts": NOW,
+        "type": event_type,
+        "seq": 1,
+        "payload": payload,
+        "source": source,
+    })
+    assert event.payload.warning == "unpriced_model:mystery-model"
+    assert event.payload.llm_cost_thb == 0.0
+
+
+def test_budget_exhaustion_counts_only_priced_usage() -> None:
+    database = Database()
+    events = EventSink(database)
+    meter = MeteringService(
+        database, event_service=events, clock=lambda: NOW,
+        prices={"m": {"in": 10.0, "out": 0.0}},
+    )
+    meter.set_lab_budget(identity(), 5)
+
+    asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="m",
+        tokens_in=400_000, tokens_out=0,
+    ))
+    assert database.runs[("lab-a", "run-1")]["state"] == "running"
+
+    asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="unknown",
+        tokens_in=10_000_000, tokens_out=0,
+    ))
+    assert database.runs[("lab-a", "run-1")]["state"] == "running"
+
+    asyncio.run(meter.record_model_usage_async(
+        identity(), "run-1", actor="user:alice", source="hermes", model="m",
+        tokens_in=100_000, tokens_out=0,
+    ))
+    assert database.runs[("lab-a", "run-1")]["state"] == "cancelled"
+    assert database.runs[("lab-a", "run-1")]["reason"] == "budget_exhausted"
+
+
+def test_parse_model_prices_accepts_empty_object_and_rejects_invalid_input() -> None:
+    assert parse_model_prices("{}") == {}
+    assert parse_model_prices('{"m": {"in": 1, "out": 2.5}}') == {
+        "m": {"in": 1.0, "out": 2.5}
+    }
+
+    for bad in ("not json", "[]", '{"m": 1}', '{"m": {"in": -1, "out": 0}}',
+                '{"m": {"in": 1}}', '{"": {"in": 1, "out": 2}}'):
+        with pytest.raises(ValueError):
+            parse_model_prices(bad)
 
 
 def test_audit_is_tenant_scoped_and_redacts_sensitive_keys_and_raw_args() -> None:

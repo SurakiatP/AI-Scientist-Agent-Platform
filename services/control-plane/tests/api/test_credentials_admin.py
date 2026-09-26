@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
-from scilab.api.credentials_admin import A2APeerAdminService, APIKeyAdminService
+from scilab.api.credentials_admin import A2APeerAdminService, APIKeyAdminService, LabCardLookup
 from scilab.db import SET_TENANT_SQL, TENANT_SETTING
 from scilab.identity import Identity
 from scilab.tenancy import AuthorizationError
@@ -32,8 +32,20 @@ class Cursor:
         self.row = None
 
         if query == SET_TENANT_SQL:
-            assert params[0] == TENANT_SETTING
-            self.connection.tenant = params[1]
+            self.connection.settings[params[0]] = params[1]
+            if params[0] == TENANT_SETTING:
+                self.connection.tenant = params[1]
+        elif query.startswith("SELECT peer_name, lab_id, scopes, secret_hash FROM a2a_peers"):
+            digest = params[0]
+            match = next(
+                (item for item in self.connection.peers if item["secret_hash"] == digest), None
+            )
+            self.row = (
+                (match["peer_name"], match["lab_id"], match["scopes"], match["secret_hash"])
+                if match else None
+            )
+        elif query.startswith("SELECT name FROM labs WHERE id"):
+            self.row = self.connection.labs.get(params[0])
         elif query.startswith("SELECT key_id, name, scopes FROM api_credentials"):
             lab_id = params[0]
             self.rows = [
@@ -99,9 +111,11 @@ class Cursor:
 class Connection:
     def __init__(self) -> None:
         self.tenant: str | None = None
+        self.settings: dict[str, Any] = {}
         self.queries: list[tuple[str, tuple[Any, ...]]] = []
         self.api_keys: list[dict[str, Any]] = []
         self.peers: list[dict[str, Any]] = []
+        self.labs: dict[str, tuple[Any, ...]] = {}
 
     @contextmanager
     def transaction(self):
@@ -229,3 +243,30 @@ def test_create_accepts_only_a_nonblank_name() -> None:
         with pytest.raises(HTTPException) as invalid:
             service.create(admin(), body)
         assert invalid.value.status_code == 422
+
+
+def test_lookup_resolves_a_bearer_secret_to_its_peer_record() -> None:
+    connection = Connection()
+    peers = A2APeerAdminService(connection)
+    created = peers.create(admin(), {"name": "hermes"})
+
+    resolved = peers.lookup(created["secret"])
+
+    assert resolved is not None
+    assert resolved["peer_name"] == created["peer_name"]
+    assert resolved["lab_id"] == "lab-a"
+    assert peers.lookup("not-a-real-secret") is None
+
+
+def test_lab_card_lookup_scopes_by_tenant_and_returns_public_fields() -> None:
+    connection = Connection()
+    connection.labs["lab-a"] = ("Lab A",)
+    cards = LabCardLookup(connection)
+
+    card = cards.lookup("lab-a")
+
+    assert card == {"name": "Lab A", "description": "SciLab research Lab Lab A"}
+    assert connection.tenant == "lab-a"
+    assert cards.lookup("lab-missing") is None
+    assert cards.lookup("") is None
+    assert cards.lookup("   ") is None

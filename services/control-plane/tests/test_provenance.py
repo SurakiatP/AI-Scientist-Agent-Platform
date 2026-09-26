@@ -250,6 +250,7 @@ def manifest_draft(input_artifact, output_artifact, log_artifact) -> dict[str, o
         },
         "skills_image": "registry/skills@sha256:def",
         "sandbox_image": "registry/sandbox@sha256:123",
+        "runtime": {"provider": "openrouter", "model": "pi-model"},
         "inputs": [
             {
                 "artifact_id": input_artifact.id,
@@ -274,7 +275,10 @@ def manifest_draft(input_artifact, output_artifact, log_artifact) -> dict[str, o
                 "confidence": 0.8,
             }
         ],
-        "cost": {"tokens_in": 10, "tokens_out": 5, "llm_thb": 1.0, "compute_thb": 0.5},
+        "cost": {
+            "tokens_in": 10, "tokens_out": 5, "llm_thb": 1.0, "compute_thb": 0.5,
+            "unpriced_models": [],
+        },
     }
 
 

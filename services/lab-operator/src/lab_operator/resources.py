@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
+import json
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from kubernetes import client, config
 
@@ -11,6 +13,53 @@ FIELD_MANAGER = "scilab-lab-operator"
 IMAGE_DIGEST = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 SECRET_NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
+
+# Control-plane API pod labels, mirrored from deploy/helm/scilab/templates/api.yaml.
+API_POD_SELECTOR = {"app.kubernetes.io/name": "scilab", "app.kubernetes.io/component": "api"}
+# OpenSandbox broker pod label, mirrored from deploy/helm/scilab/templates/opensandbox.yaml.
+OPENSANDBOX_POD_SELECTOR = {"app.kubernetes.io/name": "opensandbox"}
+
+
+def _pod_security_context(*, fs_group: int | None = None) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "runAsNonRoot": True,
+        "runAsUser": 10001,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    if fs_group is not None:
+        context["fsGroup"] = fs_group
+    return context
+
+
+def _container_security_context(*, read_only_root_filesystem: bool) -> dict[str, Any]:
+    return {
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": read_only_root_filesystem,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
+
+def _validate_port(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    if not (1 <= value <= 65535):
+        raise ValueError(f"{field} must be a valid TCP port")
+    return value
+
+
+def _validate_cidrs(values: Any, field: str) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{field} must be a list of CIDR strings")
+    cidrs: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field} entries must be non-empty strings")
+        try:
+            ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"{field} contains an invalid CIDR: {item}") from exc
+        cidrs.append(item)
+    return cidrs
 
 
 def _require_string(value: Any, field: str) -> str:
@@ -81,9 +130,19 @@ def _metadata(name: str, namespace: str, uid: str, labels: dict[str, str]) -> di
 
 
 def build_resources(
-    *, name: str, namespace: str, uid: str, spec: Mapping[str, Any]
+    *,
+    name: str,
+    namespace: str,
+    uid: str,
+    spec: Mapping[str, Any],
+    api_port: int,
+    opensandbox_port: int,
+    external_cidrs: Sequence[str],
 ) -> tuple[dict[str, Any], ...]:
     lab_id = _validate_spec(name, namespace, uid, spec)
+    api_port = _validate_port(api_port, "SCILAB_API_PORT")
+    opensandbox_port = _validate_port(opensandbox_port, "SCILAB_OPENSANDBOX_PORT")
+    external_cidrs = _validate_cidrs(external_cidrs, "SCILAB_EXTERNAL_CIDRS")
     labels = {
         "app.kubernetes.io/name": "hermes",
         "app.kubernetes.io/instance": f"scilab-{lab_id}",
@@ -125,11 +184,14 @@ def build_resources(
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": _pod_security_context(fs_group=10001),
                     "initContainers": [
                         {
                             "name": "skills-init",
                             "image": spec["skillsImage"],
                             "command": ["/bin/sh", "-c", "cp -R /skills/. /skills-runtime/"],
+                            "securityContext": _container_security_context(read_only_root_filesystem=False),
                             "volumeMounts": [
                                 {"name": "skills-runtime", "mountPath": "/skills-runtime"}
                             ],
@@ -151,6 +213,7 @@ def build_resources(
                         ],
                             "envFrom": secret_env,
                             "resources": spec["resources"],
+                            "securityContext": _container_security_context(read_only_root_filesystem=False),
                             "volumeMounts": [
                                 {"name": "hermes-home", "mountPath": "/var/lib/hermes"},
                                 {
@@ -222,7 +285,38 @@ def build_resources(
             ],
         },
     }
-    return pvc, hermes_config, deployment, service, network_policy
+    egress_rules: list[dict[str, Any]] = [
+        {
+            "ports": [
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53},
+            ]
+        },
+        {
+            "to": [{"podSelector": {"matchLabels": API_POD_SELECTOR}}],
+            "ports": [{"protocol": "TCP", "port": api_port}],
+        },
+        {
+            "to": [{"podSelector": {"matchLabels": OPENSANDBOX_POD_SELECTOR}}],
+            "ports": [{"protocol": "TCP", "port": opensandbox_port}],
+        },
+    ]
+    # ponytail: DNS rule is port-only (no `to`) since CoreDNS pod labels vary
+    # by cluster/CNI; tighten with a podSelector once the cluster's DNS
+    # labels are known.
+    for cidr in external_cidrs:
+        egress_rules.append({"to": [{"ipBlock": {"cidr": cidr}}]})
+    egress_network_policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": owner_metadata(f"scilab-{lab_id}-hermes-egress"),
+        "spec": {
+            "podSelector": {"matchLabels": selector},
+            "policyTypes": ["Egress"],
+            "egress": egress_rules,
+        },
+    }
+    return pvc, hermes_config, deployment, service, network_policy, egress_network_policy
 
 
 def build_run_worker(
@@ -237,6 +331,12 @@ def build_run_worker(
     minio_secret: str,
     resources: Mapping[str, Any],
     release: str,
+    *,
+    hermes_image: str,
+    skills_image: str,
+    hermes_config_sha256: str,
+    sandbox_image: str,
+    model_prices_thb: str,
     opa_secret: str = "scilab-opa",
 ) -> dict[str, Any]:
     if len(lab_id) > 40 or not DNS_LABEL.fullmatch(lab_id):
@@ -259,6 +359,18 @@ def build_run_worker(
     reviewer_provider = _require_string(reviewer_provider, "Reviewer provider")
     if pi_provider == reviewer_provider:
         raise ValueError("Reviewer provider must differ from PI provider")
+    if not IMAGE_DIGEST.fullmatch(hermes_image):
+        raise ValueError("Hermes image must be pinned by digest")
+    if not IMAGE_DIGEST.fullmatch(skills_image):
+        raise ValueError("skills image must be pinned by digest")
+    if not IMAGE_DIGEST.fullmatch(sandbox_image):
+        raise ValueError("sandbox image must be pinned by digest")
+    hermes_config_sha256 = _require_string(hermes_config_sha256, "Hermes config sha256")
+    model_prices_thb = _require_string(model_prices_thb, "model prices")
+    try:
+        json.loads(model_prices_thb)
+    except ValueError as exc:
+        raise ValueError("model prices must be valid JSON") from exc
 
     labels = {
         "app.kubernetes.io/name": "scilab-run-worker",
@@ -280,20 +392,12 @@ def build_run_worker(
                 "metadata": {"labels": labels},
                 "spec": {
                     "automountServiceAccountToken": False,
-                    "securityContext": {
-                        "runAsNonRoot": True,
-                        "runAsUser": 10001,
-                        "seccompProfile": {"type": "RuntimeDefault"},
-                    },
+                    "securityContext": _pod_security_context(),
                     "containers": [{
                         "name": "run-worker",
                         "image": image,
                         "command": ["python", "-m", "scilab.runs.worker_main"],
-                        "securityContext": {
-                            "allowPrivilegeEscalation": False,
-                            "readOnlyRootFilesystem": True,
-                            "capabilities": {"drop": ["ALL"]},
-                        },
+                        "securityContext": _container_security_context(read_only_root_filesystem=True),
                         "resources": resources,
                         "envFrom": [{"secretRef": {"name": minio_secret}}],
                         "env": [
@@ -305,6 +409,11 @@ def build_run_worker(
                             {"name": "SCILAB_REVIEWER_PROVIDER", "value": reviewer_provider},
                             {"name": "SCILAB_HERMES_API_KEY", "valueFrom": {"secretKeyRef": {"name": f"scilab-{lab_id}-hermes-api", "key": "api_key"}}},
                             {"name": "SCILAB_OPA_URL", "valueFrom": {"secretKeyRef": {"name": opa_secret, "key": "SCILAB_OPA_URL"}}},
+                            {"name": "SCILAB_HERMES_IMAGE", "value": hermes_image},
+                            {"name": "SCILAB_SKILLS_IMAGE", "value": skills_image},
+                            {"name": "SCILAB_HERMES_CONFIG_SHA256", "value": hermes_config_sha256},
+                            {"name": "SCILAB_SANDBOX_IMAGE", "value": sandbox_image},
+                            {"name": "SCILAB_MODEL_PRICES_THB", "value": model_prices_thb},
                         ],
                     }],
                 },

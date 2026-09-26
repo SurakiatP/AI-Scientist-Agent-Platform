@@ -26,7 +26,13 @@ def lab_spec(lab_id: str = "alpha") -> dict[str, Any]:
     }
 
 
-def resources_for(lab_id: str = "alpha") -> tuple[dict[str, Any], ...]:
+def resources_for(
+    lab_id: str = "alpha",
+    *,
+    api_port: int = 8000,
+    opensandbox_port: int = 8080,
+    external_cidrs: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], ...]:
     from lab_operator.resources import build_resources
 
     return build_resources(
@@ -34,6 +40,9 @@ def resources_for(lab_id: str = "alpha") -> tuple[dict[str, Any], ...]:
         namespace="research",
         uid=f"uid-{lab_id}",
         spec=lab_spec(lab_id),
+        api_port=api_port,
+        opensandbox_port=opensandbox_port,
+        external_cidrs=external_cidrs,
     )
 
 
@@ -90,6 +99,7 @@ def test_builder_is_deterministic_and_emits_exact_owned_children() -> None:
         "Deployment",
         "Service",
         "NetworkPolicy",
+        "NetworkPolicy",
     ]
     assert [resource["metadata"]["name"] for resource in first] == [
         "scilab-alpha-hermes-home",
@@ -97,6 +107,7 @@ def test_builder_is_deterministic_and_emits_exact_owned_children() -> None:
         "scilab-alpha-hermes",
         "scilab-alpha-hermes",
         "scilab-alpha-hermes-ingress",
+        "scilab-alpha-hermes-egress",
     ]
     labels = {
         "app.kubernetes.io/name": "hermes",
@@ -147,19 +158,77 @@ def test_hermes_approval_config_is_lab_owned_and_mounted_read_only() -> None:
     assert {"name": "hermes-config", "mountPath": "/var/lib/hermes/config.yaml", "subPath": "config.yaml", "readOnly": True} not in pod["initContainers"][0]["volumeMounts"]
 
 
-def test_run_worker_gets_opa_url_from_secret() -> None:
+def _worker_for(**overrides: Any) -> dict[str, Any]:
     from lab_operator.resources import build_run_worker
 
-    worker = build_run_worker(
-        "alpha", "research", "uid-alpha", "registry.example/worker@sha256:" + "c" * 64,
-        "scilab-postgres", "scilab-nats", "pi", "reviewer", "scilab-minio",
-        lab_spec()["resources"], "scilab", opa_secret="scilab-opa-test",
-    )
+    kwargs: dict[str, Any] = {
+        "lab_id": "alpha",
+        "namespace": "research",
+        "uid": "uid-alpha",
+        "image": "registry.example/worker@sha256:" + "c" * 64,
+        "database_secret": "scilab-postgres",
+        "nats_secret": "scilab-nats",
+        "pi_provider": "pi",
+        "reviewer_provider": "reviewer",
+        "minio_secret": "scilab-minio",
+        "resources": lab_spec()["resources"],
+        "release": "scilab",
+        "hermes_image": "registry.example/hermes@sha256:" + "a" * 64,
+        "skills_image": "registry.example/skills@sha256:" + "b" * 64,
+        "hermes_config_sha256": "d" * 64,
+        "sandbox_image": "registry.example/sandbox@sha256:" + "e" * 64,
+        "model_prices_thb": "{}",
+    }
+    kwargs.update(overrides)
+    return build_run_worker(**kwargs)
+
+
+def test_run_worker_gets_opa_url_from_secret() -> None:
+    worker = _worker_for(opa_secret="scilab-opa-test")
     env = {item["name"]: item for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["SCILAB_OPA_URL"] == {
         "name": "SCILAB_OPA_URL",
         "valueFrom": {"secretKeyRef": {"name": "scilab-opa-test", "key": "SCILAB_OPA_URL"}},
     }
+
+
+def test_run_worker_env_carries_hermes_and_sandbox_wiring() -> None:
+    worker = _worker_for()
+    env = {item["name"]: item.get("value") for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["SCILAB_HERMES_IMAGE"] == "registry.example/hermes@sha256:" + "a" * 64
+    assert env["SCILAB_SKILLS_IMAGE"] == "registry.example/skills@sha256:" + "b" * 64
+    assert env["SCILAB_HERMES_CONFIG_SHA256"] == "d" * 64
+    assert env["SCILAB_SANDBOX_IMAGE"] == "registry.example/sandbox@sha256:" + "e" * 64
+    assert env["SCILAB_MODEL_PRICES_THB"] == "{}"
+
+
+def test_run_worker_rejects_unpinned_sandbox_image_and_bad_prices_json() -> None:
+    with pytest.raises(ValueError, match="sandbox image"):
+        _worker_for(sandbox_image="registry.example/sandbox:latest")
+    with pytest.raises(ValueError, match="model prices"):
+        _worker_for(model_prices_thb="not-json")
+
+
+def test_hermes_and_run_worker_security_context_match_except_readonly_fs() -> None:
+    hermes = by_kind(resources_for(), "Deployment")
+    hermes_pod = hermes["spec"]["template"]["spec"]
+    hermes_container = hermes_pod["containers"][0]
+    hermes_init = hermes_pod["initContainers"][0]
+    worker = _worker_for()
+    worker_pod = worker["spec"]["template"]["spec"]
+    worker_container = worker_pod["containers"][0]
+
+    assert hermes_pod["automountServiceAccountToken"] is False
+    assert worker_pod["automountServiceAccountToken"] is False
+    assert hermes_pod["securityContext"] == {
+        **worker_pod["securityContext"],
+        "fsGroup": 10001,
+    }
+    assert hermes_container["securityContext"] == {
+        **worker_container["securityContext"],
+        "readOnlyRootFilesystem": False,
+    }
+    assert hermes_init["securityContext"] == hermes_container["securityContext"]
 
 
 def test_deployment_uses_pinned_images_resources_secrets_and_read_only_skills() -> None:
@@ -240,6 +309,75 @@ def test_network_policy_allows_only_same_namespace_registered_sources() -> None:
     assert all("namespaceSelector" not in item and "ipBlock" not in item for item in ingress[0]["from"])
 
 
+def _egress_policy(resources: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    return next(
+        resource
+        for resource in resources
+        if resource["kind"] == "NetworkPolicy" and resource["metadata"]["name"].endswith("-hermes-egress")
+    )
+
+
+def test_hermes_egress_policy_allows_only_dns_api_sandbox_and_external_cidrs() -> None:
+    resources = resources_for(api_port=8000, opensandbox_port=8080, external_cidrs=("10.0.0.0/8",))
+    policy = _egress_policy(resources)
+
+    assert policy["metadata"]["name"] == "scilab-alpha-hermes-egress"
+    assert policy["spec"]["policyTypes"] == ["Egress"]
+    assert policy["spec"]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "hermes",
+        "app.kubernetes.io/instance": "scilab-alpha",
+    }
+    assert policy["spec"]["egress"] == [
+        {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+        {
+            "to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "scilab", "app.kubernetes.io/component": "api"}}}],
+            "ports": [{"protocol": "TCP", "port": 8000}],
+        },
+        {
+            "to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "opensandbox"}}}],
+            "ports": [{"protocol": "TCP", "port": 8080}],
+        },
+        {"to": [{"ipBlock": {"cidr": "10.0.0.0/8"}}]},
+    ]
+
+
+def test_hermes_egress_policy_empty_cidrs_is_valid_no_external_egress() -> None:
+    resources = resources_for(external_cidrs=())
+    policy = _egress_policy(resources)
+
+    assert len(policy["spec"]["egress"]) == 3
+    assert all("ipBlock" not in rule.get("to", [{}])[0] for rule in policy["spec"]["egress"] if "to" in rule)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"api_port": None}, "SCILAB_API_PORT"),
+        ({"api_port": 70000}, "SCILAB_API_PORT"),
+        ({"opensandbox_port": "8080"}, "SCILAB_OPENSANDBOX_PORT"),
+        ({"external_cidrs": ["not-a-cidr"]}, "SCILAB_EXTERNAL_CIDRS"),
+        ({"external_cidrs": "10.0.0.0/8"}, "SCILAB_EXTERNAL_CIDRS"),
+    ],
+)
+def test_hermes_egress_policy_is_fail_closed_on_bad_env(kwargs: dict[str, Any], message: str) -> None:
+    from lab_operator.resources import build_resources
+
+    base = {"api_port": 8000, "opensandbox_port": 8080, "external_cidrs": ()}
+    base.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        build_resources(name="alpha", namespace="research", uid="uid-alpha", spec=lab_spec(), **base)
+
+
+def test_reconcile_requires_api_port_opensandbox_port_and_cidrs(monkeypatch: pytest.MonkeyPatch) -> None:
+    import lab_operator.handlers as handlers
+
+    monkeypatch.delenv("SCILAB_API_PORT", raising=False)
+    monkeypatch.delenv("SCILAB_OPENSANDBOX_PORT", raising=False)
+    monkeypatch.delenv("SCILAB_EXTERNAL_CIDRS", raising=False)
+    with pytest.raises(ValueError, match="SCILAB_API_PORT"):
+        handlers.reconcile(spec=lab_spec(), name="alpha", namespace="research", uid="uid-alpha")
+
+
 @pytest.mark.parametrize(
     ("name", "spec", "message"),
     [
@@ -255,7 +393,10 @@ def test_invalid_spec_is_rejected_before_resource_build(
     from lab_operator.resources import build_resources
 
     with pytest.raises(ValueError, match=message):
-        build_resources(name=name, namespace="research", uid="uid-alpha", spec=spec)
+        build_resources(
+            name=name, namespace="research", uid="uid-alpha", spec=spec,
+            api_port=8000, opensandbox_port=8080, external_cidrs=(),
+        )
 
 
 def test_apply_dispatches_each_kind_with_server_side_apply_arguments() -> None:
@@ -272,7 +413,10 @@ def test_apply_dispatches_each_kind_with_server_side_apply_arguments() -> None:
         "patch_namespaced_service",
     ]
     assert [call[0] for call in apps.calls] == ["patch_namespaced_deployment"]
-    assert [call[0] for call in networking.calls] == ["patch_namespaced_network_policy"]
+    assert [call[0] for call in networking.calls] == [
+        "patch_namespaced_network_policy",
+        "patch_namespaced_network_policy",
+    ]
     for api in (apps, core, networking):
         for _, args, kwargs in api.calls:
             assert kwargs["field_manager"] == "scilab-lab-operator"
@@ -285,6 +429,9 @@ def test_apply_dispatches_each_kind_with_server_side_apply_arguments() -> None:
 def test_reconcile_builds_and_applies_instead_of_returning_only_manifests(monkeypatch: pytest.MonkeyPatch) -> None:
     import lab_operator.handlers as handlers
 
+    monkeypatch.setenv("SCILAB_API_PORT", "8000")
+    monkeypatch.setenv("SCILAB_OPENSANDBOX_PORT", "8080")
+    monkeypatch.setenv("SCILAB_EXTERNAL_CIDRS", "")
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(handlers, "apply_resources", lambda resources: calls.append(resources))
     result = handlers.reconcile(
@@ -293,4 +440,4 @@ def test_reconcile_builds_and_applies_instead_of_returning_only_manifests(monkey
 
     assert result is None
     assert len(calls) == 1
-    assert len(calls[0]) == 5
+    assert len(calls[0]) == 6

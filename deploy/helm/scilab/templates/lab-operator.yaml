@@ -1,5 +1,6 @@
 {{- $piProvider := required "runWorker.piProvider is required" (trim (toString (default "" .Values.runWorker.piProvider))) -}}
 {{- $reviewerProvider := required "runWorker.reviewerProvider is required" (trim (toString (default "" .Values.runWorker.reviewerProvider))) -}}
+{{- $sandboxImage := printf "opensandbox/execd:release-1.1.0@sha256:%s" (include "scilab.digest" (dict "path" "images.openSandbox.execd" "digest" .Values.images.openSandbox.execd.digest)) -}}
 {{- if eq $piProvider $reviewerProvider -}}
 {{- fail "runWorker.piProvider and runWorker.reviewerProvider must differ" -}}
 {{- end }}
@@ -100,3 +101,13 @@ spec:
               value: {{ $piProvider | quote }}
             - name: SCILAB_REVIEWER_PROVIDER
               value: {{ $reviewerProvider | quote }}
+            - name: SCILAB_API_PORT
+              value: {{ .Values.api.port | quote }}
+            - name: SCILAB_OPENSANDBOX_PORT
+              value: {{ .Values.openSandbox.serverPort | quote }}
+            - name: SCILAB_EXTERNAL_CIDRS
+              value: {{ join "," .Values.network.externalCidrs | quote }}
+            - name: SCILAB_SANDBOX_IMAGE
+              value: {{ $sandboxImage | quote }}
+            - name: SCILAB_MODEL_PRICES_THB
+              value: {{ toJson .Values.metering.modelPricesThb | quote }}

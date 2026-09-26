@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
+import boto3
 import httpx
 import nats
 import psycopg
@@ -20,14 +21,20 @@ from minio import Minio
 
 from scilab.api.inputs import InputUploadService
 from scilab.approvals import ApprovalService, OPAClient
+from scilab.artifacts import ArtifactService
+from scilab.audit import AuditService
 from scilab.events import EventService
 from scilab.hermes import HermesClient
 from scilab.identity import Identity
 from scilab.infra.nats_events import NatsEventBus
+from scilab.infra.s3_artifacts import S3ArtifactStorage
+from scilab.metering import MeteringService, parse_model_prices
 from scilab.orchestration import ResearchCycle
+from scilab.provenance import ManifestService
 from scilab.runs.executor import RunExecutor
 from scilab.runs.model import RunState
 from scilab.runs.service import RunService
+from scilab.runs.state import RunStateError, due_transition
 from scilab.runs.worker import RunWorker
 
 _LOG = logging.getLogger("scilab.runs.worker")
@@ -45,6 +52,12 @@ _REQUIRED_ENV = (
     "SCILAB_MINIO_SECRET_KEY",
     "SCILAB_INPUT_BUCKET",
     "SCILAB_OPA_URL",
+    "SCILAB_MODEL_PRICES_THB",
+    "SCILAB_ARTIFACT_BUCKET",
+    "SCILAB_HERMES_IMAGE",
+    "SCILAB_SKILLS_IMAGE",
+    "SCILAB_HERMES_CONFIG_SHA256",
+    "SCILAB_SANDBOX_IMAGE",
 )
 
 
@@ -75,6 +88,12 @@ class WorkerSettings:
     minio_secret_key: str = field(repr=False)
     input_bucket: str
     opa_url: str = field(repr=False)
+    model_prices: dict[str, dict[str, float]] = field(repr=False)
+    artifact_bucket: str
+    hermes_image: str
+    skills_image: str
+    hermes_config_sha256: str
+    sandbox_image: str
 
     @classmethod
     def from_environment(
@@ -112,6 +131,12 @@ class WorkerSettings:
             minio_secret_key=values["SCILAB_MINIO_SECRET_KEY"],
             input_bucket=values["SCILAB_INPUT_BUCKET"],
             opa_url=values["SCILAB_OPA_URL"],
+            model_prices=parse_model_prices(values["SCILAB_MODEL_PRICES_THB"]),
+            artifact_bucket=values["SCILAB_ARTIFACT_BUCKET"],
+            hermes_image=values["SCILAB_HERMES_IMAGE"],
+            skills_image=values["SCILAB_SKILLS_IMAGE"],
+            hermes_config_sha256=values["SCILAB_HERMES_CONFIG_SHA256"],
+            sandbox_image=values["SCILAB_SANDBOX_IMAGE"],
         )
 
     @property
@@ -250,13 +275,92 @@ async def reconcile_approvals_forever(
         await asyncio.sleep(interval)
 
 
+async def reconcile_runs_forever(
+    runs: RunService,
+    events: EventService,
+    client: HermesClient,
+    identity: Identity,
+    *,
+    interval: float = 30.0,
+) -> None:
+    """Enforce queue/run/heartbeat timeouts off the claim-and-execute loop.
+
+    A worker that dies or hangs without renewing a Run's lease never raises;
+    its Run just stops receiving heartbeats, so a transient worker error and a
+    genuinely dropped Hermes connection both surface here identically as
+    ``heartbeat_loss``. Auto-retry (max 2, same row per D-006) only applies to
+    that reason; ``run_timeout``/``queue_timeout``/``rejected``/``stopped``
+    Runs are never retried.
+
+    ``heartbeat_loss`` only fires for a Run whose claim lease actually exists
+    and has expired (Q25): a stale ``last_heartbeat_at`` alone is not enough,
+    since an unclaimed RUNNING Run (e.g. resumed after approval and waiting
+    for the single per-Lab worker, or mid a long synchronous completion step)
+    has no crashed worker to recover from and must keep waiting.
+    """
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+    while True:
+        try:
+            active = await asyncio.to_thread(runs.list_active, identity)
+            now = datetime.now(UTC)
+            for run in active:
+                due = due_transition(run, now)
+                if due is None:
+                    continue
+                target, reason = due
+                if reason == "heartbeat_loss":
+                    lease_expires_at = await asyncio.to_thread(
+                        runs.lease_expires_at, identity, run.id
+                    )
+                    if lease_expires_at is None or lease_expires_at > now:
+                        continue
+                try:
+                    updated = await asyncio.to_thread(
+                        runs.transition, identity, run.id, target, reason=reason
+                    )
+                except RunStateError:
+                    continue
+                try:
+                    await events.publish_event(
+                        identity, run.id, "run.state",
+                        {"from": str(run.state), "to": str(updated.state), "reason": reason},
+                        "run-service",
+                    )
+                except Exception:
+                    _LOG.exception("Timeout state event failed for Run %s", run.id)
+                if run.hermes_run_id:
+                    try:
+                        await client.stop(identity.lab_id, run.hermes_run_id)
+                    except Exception:
+                        _LOG.exception("Hermes stop failed for timed-out Run %s", run.id)
+                if reason == "heartbeat_loss" and run.retry_count < 2:
+                    try:
+                        await asyncio.to_thread(runs.retry, identity, run.id)
+                    except RunStateError:
+                        continue
+                    try:
+                        await events.publish_event(
+                            identity, run.id, "run.state",
+                            {"from": "failed", "to": "queued", "reason": "heartbeat_loss"},
+                            "run-service",
+                        )
+                    except Exception:
+                        _LOG.exception("Retry state event failed for Run %s", run.id)
+        except Exception:
+            _LOG.exception("Run reconciliation failed for Lab %s", identity.lab_id)
+        await asyncio.sleep(interval)
+
+
 async def run_worker(settings: WorkerSettings) -> None:
     connection = psycopg.connect(settings.database_url, autocommit=True)
     cleanup_connection = None
     approval_connection = None
+    reconcile_connection = None
     try:
         cleanup_connection = psycopg.connect(settings.database_url, autocommit=True)
         approval_connection = psycopg.connect(settings.database_url, autocommit=True)
+        reconcile_connection = psycopg.connect(settings.database_url, autocommit=True)
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
         nats_client = await nats.connect(settings.nats_url)
@@ -265,6 +369,7 @@ async def run_worker(settings: WorkerSettings) -> None:
                 cycle = create_lab_cycle(settings, transport)
                 events = EventService(connection, NatsEventBus(nats_client))
                 expiry_events = EventService(approval_connection, NatsEventBus(nats_client))
+                reconcile_events = EventService(reconcile_connection, NatsEventBus(nats_client))
                 endpoint = urlsplit(settings.minio_url)
                 storage = Minio(
                     endpoint.netloc,
@@ -273,6 +378,18 @@ async def run_worker(settings: WorkerSettings) -> None:
                     secure=endpoint.scheme == "https",
                 )
                 inputs = InputUploadService(cleanup_connection, storage, bucket=settings.input_bucket)
+                s3 = boto3.client(
+                    "s3",
+                    endpoint_url=settings.minio_url,
+                    aws_access_key_id=settings.minio_access_key,
+                    aws_secret_access_key=settings.minio_secret_key,
+                    region_name="us-east-1",
+                )
+                s3.head_bucket(Bucket=settings.artifact_bucket)
+                artifacts = ArtifactService(
+                    connection, S3ArtifactStorage(s3, bucket=settings.artifact_bucket)
+                )
+                manifests = ManifestService(connection, artifacts)
 
                 def cycle_for_lab(lab_id: str) -> ResearchCycle:
                     if lab_id != settings.lab_id:
@@ -281,7 +398,26 @@ async def run_worker(settings: WorkerSettings) -> None:
 
                 approvals = ApprovalService(connection, OPAClient(settings.opa_url), events)
                 expiry = ApprovalService(approval_connection, OPAClient(settings.opa_url), expiry_events)
-                executor = RunExecutor(RunWorker(connection), events, cycle_for_lab, approvals=approvals)
+                metering = MeteringService(
+                    connection,
+                    event_service=events,
+                    run_service=RunService(connection),
+                    audit_service=AuditService(connection),
+                    prices=settings.model_prices,
+                )
+                executor = RunExecutor(
+                    RunWorker(connection),
+                    events,
+                    cycle_for_lab,
+                    approvals=approvals,
+                    metering=metering,
+                    artifacts=artifacts,
+                    manifests=manifests,
+                    hermes_image=settings.hermes_image,
+                    hermes_config_sha256=settings.hermes_config_sha256,
+                    skills_image=settings.skills_image,
+                    sandbox_image=settings.sandbox_image,
+                )
                 identity = Identity(
                     settings.lab_id,
                     "service:run-worker",
@@ -291,6 +427,7 @@ async def run_worker(settings: WorkerSettings) -> None:
                     poll_forever(executor, identity),
                 reconcile_pending_forever(inputs, identity),
                     reconcile_approvals_forever(expiry, RunService(approval_connection), cycle.client, expiry_events, identity),
+                    reconcile_runs_forever(RunService(reconcile_connection), reconcile_events, cycle.client, identity),
                 )
         finally:
             await nats_client.close()
@@ -299,6 +436,8 @@ async def run_worker(settings: WorkerSettings) -> None:
             cleanup_connection.close()
         if approval_connection is not None:
             approval_connection.close()
+        if reconcile_connection is not None:
+            reconcile_connection.close()
         connection.close()
 
 

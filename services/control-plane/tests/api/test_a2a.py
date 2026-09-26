@@ -61,9 +61,60 @@ def test_agent_card_is_scoped_to_lab_and_advertises_tor_modes() -> None:
     assert {skill["id"] for skill in card["skills"]} == {
         "research_task", "ask_lab", "literature_review"
     }
+    ask_lab_skill = next(skill for skill in card["skills"] if skill["id"] == "ask_lab")
+    assert "requires:artifacts:read" in ask_lab_skill["tags"]
     schema = json.loads((Path(__file__).parents[4] / "contracts/a2a/agent-card.schema.json").read_text())
     validate(card, schema)
     assert request(app, "GET", "/labs/other/.well-known/agent-card.json").status_code == 404
+
+
+def test_lab_cards_may_be_a_callable_looked_up_per_request() -> None:
+    create_app = importlib.import_module("scilab.api.a2a").create_app
+    calls: list[str] = []
+
+    def lookup(lab: str) -> dict[str, str] | None:
+        calls.append(lab)
+        return {"name": "Bio", "description": "Research lab"} if lab == "lab-bio" else None
+
+    app = create_app(services=SimpleNamespace(), peers=[], lab_cards=lookup)
+
+    found = request(app, "GET", "/labs/lab-bio/.well-known/agent-card.json")
+    missing = request(app, "GET", "/labs/other/.well-known/agent-card.json")
+
+    assert found.status_code == 200
+    assert found.json()["name"] == "Bio"
+    assert missing.status_code == 404
+    assert calls == ["lab-bio", "lab-bio", "other"]
+
+
+def test_a2a_app_mounted_under_parent_app_enforces_auth_and_tls() -> None:
+    from fastapi import FastAPI
+
+    create_app = importlib.import_module("scilab.api.a2a").create_app
+    inner = create_app(
+        services=SimpleNamespace(),
+        peers=[{"peer_name": "peer-a", "lab_id": "lab-bio",
+                "secret_hash": credential_digest("registered-peer"),
+                "scopes": ["runs:read"]}],
+        lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
+    )
+    parent = FastAPI()
+    parent.mount("/a2a", inner)
+    body = {"jsonrpc": "2.0", "id": "get-1", "method": "GetTask", "params": {"id": "run-1"}}
+
+    unauthenticated = request(parent, "POST", "/a2a/labs/lab-bio", json=body)
+    assert unauthenticated.status_code == 401
+
+    insecure = request(
+        parent, "POST", "/a2a/labs/lab-bio", json=body,
+        headers={"Authorization": "Bearer registered-peer"},
+        base_url="http://a2a.scilab.example",
+    )
+    assert insecure.status_code == 403
+
+    assert request(
+        parent, "GET", "/a2a/labs/lab-bio/.well-known/agent-card.json"
+    ).status_code == 200
 
 
 def test_registered_peer_send_message_creates_lab_run_with_context() -> None:
@@ -71,7 +122,9 @@ def test_registered_peer_send_message_creates_lab_run_with_context() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[object, object, object]] = []
 
-        def create(self, identity: object, message: object, context_id: str) -> object:
+        def create(
+            self, identity: object, message: object, context_id: str, params: object = None
+        ) -> object:
             self.calls.append((identity, message, context_id))
             return SimpleNamespace(id="run-1", state="queued")
 
@@ -117,9 +170,93 @@ def test_registered_peer_send_message_creates_lab_run_with_context() -> None:
     assert len(submission.calls) == 1
 
 
+def test_send_message_with_ask_lab_skill_calls_ask_and_creates_no_run() -> None:
+    ask_calls: list[tuple[object, object]] = []
+    run_calls: list[str] = []
+
+    class Ask:
+        async def ask(self, identity: object, body: dict[str, str]) -> dict[str, object]:
+            ask_calls.append((identity, body))
+            return {"answer": "42", "sources": []}
+
+    class Submission:
+        def create(self, *args: object) -> object:
+            run_calls.append("create")
+            raise AssertionError("ask_lab must not create a Run")
+
+    create_app = importlib.import_module("scilab.api.a2a").create_app
+    app = create_app(
+        services=SimpleNamespace(ask=Ask(), run_submission=Submission()),
+        peers=[{
+            "peer_name": "peer-a", "lab_id": "lab-bio",
+            "secret_hash": credential_digest("registered-peer"),
+            "scopes": ["runs:read", "runs:write", "artifacts:read"],
+        }],
+        lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
+    )
+    body = {
+        "jsonrpc": "2.0", "id": "ask-1", "method": "SendMessage",
+        "params": {"message": {
+            "messageId": "msg-1", "contextId": "context-1", "role": "ROLE_USER",
+            "parts": [{"text": "What is the result?"}],
+            "metadata": {"skill": "ask_lab"},
+        }},
+    }
+
+    response = request(app, "POST", "/labs/lab-bio", json=body,
+                       headers={"Authorization": "Bearer registered-peer"})
+
+    assert response.status_code == 200
+    message = response.json()["result"]["message"]
+    assert message["parts"][0]["text"] == "42"
+    assert message["contextId"] == "context-1"
+    assert run_calls == []
+    assert len(ask_calls) == 1
+    identity, ask_body = ask_calls[0]
+    assert identity.lab_id == "lab-bio"
+    assert identity.principal == "peer:peer-a"
+    assert ask_body == {"question": "What is the result?"}
+
+
+def test_send_message_with_ask_lab_skill_requires_artifacts_read_scope() -> None:
+    ask_calls: list[str] = []
+
+    class Ask:
+        async def ask(self, identity: object, body: dict[str, str]) -> dict[str, object]:
+            ask_calls.append("ask")
+            return {"answer": "42", "sources": []}
+
+    create_app = importlib.import_module("scilab.api.a2a").create_app
+    app = create_app(
+        services=SimpleNamespace(ask=Ask()),
+        peers=[{
+            "peer_name": "peer-a", "lab_id": "lab-bio",
+            "secret_hash": credential_digest("registered-peer"),
+            "scopes": ["runs:read", "runs:write"],
+        }],
+        lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
+    )
+    body = {
+        "jsonrpc": "2.0", "id": "ask-1", "method": "SendMessage",
+        "params": {"message": {
+            "messageId": "msg-1", "contextId": "context-1", "role": "ROLE_USER",
+            "parts": [{"text": "What is the result?"}],
+            "metadata": {"skill": "ask_lab"},
+        }},
+    }
+
+    response = request(app, "POST", "/labs/lab-bio", json=body,
+                       headers={"Authorization": "Bearer registered-peer"})
+
+    assert response.status_code == 403
+    assert ask_calls == []
+
+
 def test_peer_registered_after_app_start_is_accepted_by_lookup() -> None:
     class Submission:
-        def create(self, identity: object, message: object, context_id: str) -> object:
+        def create(
+            self, identity: object, message: object, context_id: str, params: object = None
+        ) -> object:
             return SimpleNamespace(id="run-1", state="queued", context_id=context_id)
 
     records: dict[str, dict[str, object]] = {}
@@ -301,7 +438,9 @@ def test_subscribe_to_task_streams_run_state_over_sse() -> None:
 
 def test_send_streaming_message_submits_then_streams() -> None:
     class Submission:
-        def create(self, identity: object, message: object, context_id: str) -> object:
+        def create(
+            self, identity: object, message: object, context_id: str, params: object = None
+        ) -> object:
             assert (identity.lab_id, context_id) == ("lab-bio", "context-1")
             return SimpleNamespace(id="run-1", state="queued")
 
@@ -400,18 +539,26 @@ def test_registered_push_dispatch_uses_lab_peer_vault_secret() -> None:
     ).hexdigest()
 
 
-def test_a2a_app_wires_push_dispatcher_to_persisted_event_service() -> None:
+def test_bind_push_dispatcher_wires_dispatch_to_event_service() -> None:
     a2a = importlib.import_module("scilab.api.a2a")
     events = SimpleNamespace(push_notification=None)
     dispatcher = SimpleNamespace(dispatch=lambda event: None)
 
+    a2a.bind_push_dispatcher(events, dispatcher)
+
+    assert events.push_notification is dispatcher.dispatch
+
+
+def test_create_app_does_not_wire_push_notification_at_construction() -> None:
+    a2a = importlib.import_module("scilab.api.a2a")
+    events = SimpleNamespace(push_notification=None)
+
     a2a.create_app(
         services=SimpleNamespace(events=events), peers=[],
         lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
-        push_dispatcher=dispatcher,
     )
 
-    assert events.push_notification is dispatcher.dispatch
+    assert events.push_notification is None
 
 
 def test_registered_peer_can_register_only_https_task_callback() -> None:
@@ -519,97 +666,143 @@ def test_push_migration_preserves_peers_and_enforces_tenant_rls() -> None:
     assert "DROP TABLE" not in sql
 
 
-def test_a2a_submission_persists_context_and_forwards_it_to_hermes_cycle() -> None:
+def test_a2a_submission_enqueues_run_with_a2a_channel_and_no_hermes_call() -> None:
     Submission = importlib.import_module("scilab.api.a2a").A2ARunSubmission
 
     class Runs:
         def __init__(self) -> None:
-            self.created: list[tuple[str, str, str]] = []
-            self.transitioned: list[tuple[str, str, str]] = []
+            self.calls: list[tuple[Identity, str, dict[str, object]]] = []
 
-        def create(self, identity: Identity, key: str, *, context_id: str) -> object:
-            self.created.append((identity.lab_id, key, context_id))
-            return SimpleNamespace(id="run-1", state="queued", context_id=context_id,
-                                   hermes_run_id=None)
+        async def create(self, identity: Identity, key: str, **kwargs: object) -> object:
+            self.calls.append((identity, key, kwargs))
+            return SimpleNamespace(id="run-1", state="queued",
+                                   context_id=kwargs["context_id"], hermes_run_id=None)
 
-        def transition(self, identity: Identity, run_id: str, state: str, **kwargs: object) -> object:
-            self.transitioned.append((run_id, state, kwargs["hermes_run_id"]))
-            return SimpleNamespace(id=run_id, state=state, context_id="context-1",
-                                   hermes_run_id=kwargs["hermes_run_id"], reason=None)
-
-    class Cycle:
-        lab_id = "lab-bio"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str, str]] = []
-
-        async def run(self, goal: str, *, idempotency_key: str, session_key: str) -> str:
-            self.calls.append((goal, idempotency_key, session_key))
-            return "hermes-1"
-
-    runs, cycle = Runs(), Cycle()
-    submission = Submission(
-        runs, lambda lab_id: cycle,
-        admission=SimpleNamespace(check=lambda *args: None),
-        events=SimpleNamespace(publish_event=lambda *args: None),
-    )
+    identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"}))
+    runs = Runs()
+    submission = Submission(runs, admission=SimpleNamespace(check=lambda *args: None))
     message = Message(message_id="msg-1", context_id="context-1", role=Role.ROLE_USER,
                       parts=[Part(text="Review literature")])
-    result = asyncio.run(submission.create(
-        Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"})), message, "context-1"
-    ))
 
-    assert runs.created == [("lab-bio", "msg-1", "context-1")]
-    assert cycle.calls == [("Review literature", "msg-1", "context-1")]
-    assert runs.transitioned == [("run-1", "running", "hermes-1")]
+    result = asyncio.run(submission.create(identity, message, "context-1"))
+
+    assert result.state == "queued"
     assert result.context_id == "context-1"
+    identity_arg, key_arg, kwargs = runs.calls[0]
+    assert (identity_arg, key_arg) == (identity, "msg-1")
+    assert kwargs["context_id"] == "context-1"
+    assert kwargs["actor"] == "peer:peer-a"
+    assert "budget_thb" not in kwargs
+    assert "max_minutes" not in kwargs
+    assert kwargs["request_payload"] == {
+        "goal": "Review literature", "inputs": [], "skill_packs": [],
+        "budget": None, "options": {}, "channel": "a2a",
+    }
 
 
-def test_http_a2a_send_reaches_hermes_with_the_same_session_key() -> None:
-    from scilab.hermes import HermesClient
-    from scilab.orchestration import ResearchCycle
-
-    class Transport:
-        def __init__(self) -> None:
-            self.headers: list[dict[str, str]] = []
-
-        async def request(self, method: str, url: str, **kwargs: object) -> object:
-            self.headers.append(kwargs["headers"])
-
-            class Response:
-                def json(self) -> dict[str, str]:
-                    return {"run_id": "hermes-1"}
-
-            return Response()
+def test_a2a_submission_passes_metadata_budget_to_run_service() -> None:
+    Submission = importlib.import_module("scilab.api.a2a").A2ARunSubmission
 
     class Runs:
-        def create(self, identity: Identity, key: str, *, context_id: str) -> object:
-            assert (identity.lab_id, key, context_id) == ("lab-bio", "msg-1", "context-1")
+        def __init__(self) -> None:
+            self.calls: list[tuple[Identity, str, dict[str, object]]] = []
+
+        async def create(self, identity: Identity, key: str, **kwargs: object) -> object:
+            self.calls.append((identity, key, kwargs))
+            return SimpleNamespace(id="run-1", state="queued",
+                                   context_id=kwargs["context_id"], hermes_run_id=None)
+
+    identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"}))
+    runs = Runs()
+    submission = Submission(runs, admission=SimpleNamespace(check=lambda *args: None))
+    message = Message(message_id="msg-1", context_id="context-1", role=Role.ROLE_USER,
+                      parts=[Part(text="Review literature")],
+                      metadata={"budget_thb": 42.5, "max_minutes": 30})
+
+    result = asyncio.run(submission.create(identity, message, "context-1"))
+
+    assert result.state == "queued"
+    _, _, kwargs = runs.calls[0]
+    assert kwargs["budget_thb"] == 42.5
+    assert kwargs["max_minutes"] == 30
+    assert kwargs["request_payload"]["budget"] == {"thb": 42.5, "max_minutes": 30}
+
+
+def test_a2a_submission_metadata_budget_defaults_max_minutes() -> None:
+    Submission = importlib.import_module("scilab.api.a2a").A2ARunSubmission
+
+    class Runs:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Identity, str, dict[str, object]]] = []
+
+        async def create(self, identity: Identity, key: str, **kwargs: object) -> object:
+            self.calls.append((identity, key, kwargs))
+            return SimpleNamespace(id="run-1", state="queued",
+                                   context_id=kwargs["context_id"], hermes_run_id=None)
+
+    identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"}))
+    runs = Runs()
+    submission = Submission(runs, admission=SimpleNamespace(check=lambda *args: None))
+    message = Message(message_id="msg-1", context_id="context-1", role=Role.ROLE_USER,
+                      parts=[Part(text="Review literature")],
+                      metadata={"budget_thb": 10})
+
+    asyncio.run(submission.create(identity, message, "context-1"))
+
+    _, _, kwargs = runs.calls[0]
+    assert kwargs["budget_thb"] == 10.0
+    assert kwargs["max_minutes"] == 120
+    assert kwargs["request_payload"]["budget"] == {"thb": 10.0, "max_minutes": 120}
+
+
+@pytest.mark.parametrize("metadata", [
+    {"budget_thb": -1},
+    {"budget_thb": "not-a-number"},
+    {"budget_thb": float("inf")},
+    {"budget_thb": 10, "max_minutes": 0},
+    {"budget_thb": 10, "max_minutes": -5},
+    {"budget_thb": 10, "max_minutes": 1.5},
+])
+def test_a2a_submission_rejects_invalid_metadata_budget(metadata: dict[str, object]) -> None:
+    a2a = importlib.import_module("scilab.api.a2a")
+
+    class Runs:
+        async def create(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("invalid budget must not create a Run")
+
+    identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"}))
+    submission = a2a.A2ARunSubmission(Runs(), admission=SimpleNamespace(check=lambda *args: None))
+    message = Message(message_id="msg-1", context_id="context-1", role=Role.ROLE_USER,
+                      parts=[Part(text="Review literature")], metadata=metadata)
+
+    with pytest.raises(a2a.InvalidParamsError):
+        asyncio.run(submission.create(identity, message, "context-1"))
+
+
+def test_http_a2a_send_message_enqueues_run_via_run_service_contract() -> None:
+    a2a = importlib.import_module("scilab.api.a2a")
+
+    class Runs:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def create(self, identity: Identity, idempotency_key: str, *, context_id=None,
+                         budget_thb=None, request_payload=None, actor=None) -> object:
+            self.calls.append((identity, idempotency_key, context_id, budget_thb,
+                              request_payload, actor))
             return SimpleNamespace(id="run-1", state="queued", context_id=context_id,
                                    hermes_run_id=None)
 
-        def transition(self, identity: Identity, run_id: str, state: str, **kwargs: object) -> object:
-            return SimpleNamespace(id=run_id, state=state, context_id="context-1",
-                                   hermes_run_id=kwargs["hermes_run_id"], reason=None)
-
-    transport = Transport()
-    hermes = HermesClient(
-        {"lab-bio": "https://hermes.internal"}, "test-api-key", "session-1",
-        "default-session", transport
-    )
-    cycle = ResearchCycle(hermes, "lab-bio", "provider-a", "provider-b")
-    a2a = importlib.import_module("scilab.api.a2a")
+    runs = Runs()
+    submission = a2a.A2ARunSubmission(runs, admission=SimpleNamespace(check=lambda *args: None))
     app = a2a.create_app(
-        services=SimpleNamespace(run_submission=a2a.A2ARunSubmission(
-            Runs(), lambda _: cycle,
-            admission=SimpleNamespace(check=lambda *args: None),
-            events=SimpleNamespace(publish_event=lambda *args: None),
-        )),
+        services=SimpleNamespace(run_submission=submission),
         peers=[{"peer_name": "peer-a", "lab_id": "lab-bio",
                 "secret_hash": credential_digest("registered-peer"),
                 "scopes": ["runs:read", "runs:write"]}],
         lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
     )
+
     response = request(
         app, "POST", "/labs/lab-bio",
         json={"jsonrpc": "2.0", "id": "send-1", "method": "SendMessage",
@@ -619,16 +812,96 @@ def test_http_a2a_send_reaches_hermes_with_the_same_session_key() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["result"]["task"]["id"] == "run-1"
-    assert transport.headers[0]["X-Hermes-Session-Key"] == "context-1"
+    task = response.json()["result"]["task"]
+    assert task["id"] == "run-1"
+    assert task["status"]["state"] == "TASK_STATE_SUBMITTED"
+    identity, key, context_id, budget_thb, request_payload, actor = runs.calls[0]
+    assert identity.principal == "peer:peer-a"
+    assert key == "msg-1"
+    assert context_id == "context-1"
+    assert budget_thb is None
+    assert actor == "peer:peer-a"
+    assert request_payload["channel"] == "a2a"
+    assert request_payload["goal"] == "Research"
+    assert request_payload["budget"] is None
+    assert "100" not in json.dumps(request_payload)
 
 
-def test_a2a_submission_checks_admission_before_run_and_publishes_state_event() -> None:
+def test_http_a2a_send_message_with_params_metadata_budget_sets_run_budget() -> None:
+    a2a = importlib.import_module("scilab.api.a2a")
+
+    class Runs:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def create(self, identity: Identity, idempotency_key: str, *, context_id=None,
+                         budget_thb=None, max_minutes=120, request_payload=None,
+                         actor=None) -> object:
+            self.calls.append((identity, idempotency_key, context_id, budget_thb,
+                              max_minutes, request_payload, actor))
+            return SimpleNamespace(id="run-1", state="queued", context_id=context_id,
+                                   hermes_run_id=None)
+
+    runs = Runs()
+    submission = a2a.A2ARunSubmission(runs, admission=SimpleNamespace(check=lambda *args: None))
+    app = a2a.create_app(
+        services=SimpleNamespace(run_submission=submission),
+        peers=[{"peer_name": "peer-a", "lab_id": "lab-bio",
+                "secret_hash": credential_digest("registered-peer"),
+                "scopes": ["runs:read", "runs:write"]}],
+        lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
+    )
+
+    response = request(
+        app, "POST", "/labs/lab-bio",
+        json={"jsonrpc": "2.0", "id": "send-1", "method": "SendMessage",
+              "params": {"message": {"messageId": "msg-1", "contextId": "context-1",
+                                     "role": "ROLE_USER", "parts": [{"text": "Research"}]},
+                        "metadata": {"budget_thb": 75, "max_minutes": 45}}},
+        headers={"Authorization": "Bearer registered-peer"},
+    )
+
+    assert response.status_code == 200
+    identity, key, context_id, budget_thb, max_minutes, request_payload, actor = runs.calls[0]
+    assert budget_thb == 75.0
+    assert max_minutes == 45
+    assert request_payload["budget"] == {"thb": 75.0, "max_minutes": 45}
+
+
+def test_http_a2a_send_message_with_invalid_metadata_budget_rejects_and_creates_no_run() -> None:
+    a2a = importlib.import_module("scilab.api.a2a")
+
+    class Runs:
+        async def create(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("invalid budget must not create a Run")
+
+    submission = a2a.A2ARunSubmission(Runs(), admission=SimpleNamespace(check=lambda *args: None))
+    app = a2a.create_app(
+        services=SimpleNamespace(run_submission=submission),
+        peers=[{"peer_name": "peer-a", "lab_id": "lab-bio",
+                "secret_hash": credential_digest("registered-peer"),
+                "scopes": ["runs:read", "runs:write"]}],
+        lab_cards={"lab-bio": {"name": "Bio", "description": "Research lab"}},
+    )
+
+    response = request(
+        app, "POST", "/labs/lab-bio",
+        json={"jsonrpc": "2.0", "id": "send-1", "method": "SendMessage",
+              "params": {"message": {"messageId": "msg-1", "contextId": "context-1",
+                                     "role": "ROLE_USER", "parts": [{"text": "Research"}],
+                                     "metadata": {"budget_thb": -5}}}},
+        headers={"Authorization": "Bearer registered-peer"},
+    )
+
+    assert response.status_code == 200
+    assert "error" in response.json()
+
+
+def test_a2a_submission_checks_admission_before_enqueueing_run() -> None:
     a2a = importlib.import_module("scilab.api.a2a")
     identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:write"}))
     order: list[str] = []
     admission_calls: list[tuple[object, dict[str, object], str]] = []
-    event_calls: list[tuple[object, ...]] = []
 
     class Admission:
         async def check(
@@ -637,53 +910,24 @@ def test_a2a_submission_checks_admission_before_run_and_publishes_state_event() 
             order.append("admission")
             admission_calls.append((actor, payload, idempotency_key))
 
-    class Events:
-        async def publish_event(self, *args: object) -> None:
-            order.append("event")
-            event_calls.append(args)
-
     class Runs:
-        async def create(self, actor: object, key: str, *, context_id: str) -> object:
+        async def create(self, identity: object, key: str, **kwargs: object) -> object:
             order.append("create")
             return SimpleNamespace(
-                id="run-1", state="queued", context_id=context_id, hermes_run_id=None
+                id="run-1", state="queued", context_id=kwargs["context_id"], hermes_run_id=None
             )
-
-        async def transition(
-            self, actor: object, run_id: str, state: str, **kwargs: object
-        ) -> object:
-            order.append("transition")
-            return SimpleNamespace(
-                id=run_id, state=state, context_id="context-1",
-                hermes_run_id=kwargs["hermes_run_id"], reason=None,
-            )
-
-    class Cycle:
-        lab_id = "lab-bio"
-
-        async def run(self, goal: str, **kwargs: object) -> str:
-            order.append("hermes")
-            return "hermes-1"
 
     message = Message(
         message_id="msg-1", context_id="context-1", role=Role.ROLE_USER,
         parts=[Part(text="Research")],
     )
-    submission = a2a.A2ARunSubmission(
-        Runs(), lambda _: Cycle(), admission=Admission(), events=Events()
-    )
+    submission = a2a.A2ARunSubmission(Runs(), admission=Admission())
 
     result = asyncio.run(submission.create(identity, message, "context-1"))
 
     assert result.id == "run-1"
     assert admission_calls == [(identity, MessageToDict(message), "msg-1")]
-    assert order == ["admission", "create", "hermes", "transition", "event"]
-    assert event_calls == [
-        (
-            identity, "run-1", "run.state",
-            {"from": "queued", "to": "running", "reason": ""}, "run-service",
-        )
-    ]
+    assert order == ["admission", "create"]
 
 
 def test_a2a_submission_fails_closed_without_admission_service() -> None:
@@ -696,12 +940,9 @@ def test_a2a_submission_fails_closed_without_admission_service() -> None:
             created.append("run")
             return SimpleNamespace(id="run-1", state="queued")
 
-    class Cycle:
-        lab_id = "lab-bio"
-
     with pytest.raises(RuntimeError, match="admission"):
         asyncio.run(
-            a2a.A2ARunSubmission(Runs(), lambda _: Cycle()).create(
+            a2a.A2ARunSubmission(Runs()).create(
                 identity,
                 Message(
                     message_id="msg-1", context_id="context-1",
@@ -714,7 +955,9 @@ def test_a2a_submission_fails_closed_without_admission_service() -> None:
     assert created == []
 
 
-def test_cancel_task_stops_hermes_before_transition_and_publishes_state() -> None:
+def test_cancel_task_only_stops_the_run_and_publishes_state() -> None:
+    # ponytail: the worker stops Hermes when it observes the cancelled run state (Q22);
+    # A2A cancel must not call Hermes directly, so no Hermes double exists in this test at all.
     a2a = importlib.import_module("scilab.api.a2a")
     identity = Identity("lab-bio", "peer:peer-a", frozenset({"runs:read", "runs:write"}))
     order: list[tuple[object, ...]] = []
@@ -733,20 +976,12 @@ def test_cancel_task_stops_hermes_before_transition_and_publishes_state() -> Non
                 hermes_run_id="hermes-42", reason="stopped",
             )
 
-    class Client:
-        async def stop(self, lab_id: str, hermes_run_id: str) -> None:
-            order.append(("hermes-stop", lab_id, hermes_run_id))
-
-    class Submission:
-        def cycle_for_lab(self, lab_id: str) -> object:
-            return SimpleNamespace(lab_id=lab_id, client=Client())
-
     class Events:
         async def publish_event(self, *args: object) -> None:
             order.append(("event", *args))
 
     app = a2a.create_app(
-        services=SimpleNamespace(runs=Runs(), run_submission=Submission(), events=Events()),
+        services=SimpleNamespace(runs=Runs(), events=Events()),
         peers=[{
             "peer_name": "peer-a", "lab_id": "lab-bio",
             "secret_hash": credential_digest("registered-peer"),
@@ -766,7 +1001,6 @@ def test_cancel_task_stops_hermes_before_transition_and_publishes_state() -> Non
     assert response.status_code == 200
     assert response.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
     assert order == [
-        ("hermes-stop", "lab-bio", "hermes-42"),
         ("run-stop", identity, "run-1"),
         (
             "event", identity, "run-1", "run.state",

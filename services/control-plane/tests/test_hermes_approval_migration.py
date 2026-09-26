@@ -46,7 +46,7 @@ def test_postgres_hermes_approval_rls_and_staged_run() -> None:
             conn.execute(path.read_text())
         conn.execute((migrations / "016_hermes_approval.sql").read_text())
         conn.execute("CREATE ROLE hermes_approval_probe")
-        conn.execute("GRANT ALL ON labs, runs, approvals, run_events TO hermes_approval_probe")
+        conn.execute("GRANT ALL ON labs, runs, approvals, run_events, audit_events TO hermes_approval_probe")
         with conn.transaction():
             conn.execute("SELECT set_config('scilab.current_lab_id', 'lab-a', true)")
             conn.execute("INSERT INTO labs (id, name) VALUES ('lab-a', 'A')")

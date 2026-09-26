@@ -45,7 +45,6 @@ class _Harness:
     def __init__(
         self,
         *,
-        cycle_lab: str = "lab-a",
         current_run: Run | None = None,
         created_run: Run | None = None,
         transitioned_run: Run | None = None,
@@ -93,7 +92,7 @@ class _Harness:
             self.calls.append(("metering.aggregate_usage", identity, kwargs))
             return UsageSummary(10, 20, 0.3, 0.2, 0.3, 4.0, 3.5)
 
-        def decide_approval(
+        async def decide_approval(
             identity: Identity,
             approval_id: str,
             decision: str,
@@ -142,16 +141,6 @@ class _Harness:
             self.calls.append(("manifests.verify", identity, run_id))
             return self.manifest_verified
 
-        async def run_cycle(goal: str, **kwargs: object) -> str:
-            self.calls.append(("cycle.run", goal, kwargs))
-            return "hermes-1"
-
-        cycle = SimpleNamespace(lab_id=cycle_lab, run=run_cycle)
-
-        def cycle_for_lab(lab_id: str) -> SimpleNamespace:
-            self.calls.append(("cycle_for_lab", lab_id))
-            return cycle
-
         async def ask_knowledge(identity: Identity, question: str) -> dict[str, object]:
             self.calls.append(("knowledge.ask", identity, question))
             return {"answer": "The Lab report says so.", "sources": ["artifact-1"]}
@@ -166,7 +155,6 @@ class _Harness:
             artifacts=SimpleNamespace(list_for_run=list_for_run, presign=presign, get=get_artifact),
             manifests=SimpleNamespace(verify=verify),
             admission=SimpleNamespace(check=check),
-            cycle_for_lab=cycle_for_lab,
             knowledge=SimpleNamespace(ask=ask_knowledge),
         )
 
@@ -190,11 +178,8 @@ def _artifact(artifact_id: str, kind: str, created_at: datetime = NOW) -> Artifa
     )
 
 
-def test_start_research_checks_admission_then_runs_idempotently_and_publishes_state() -> None:
-    harness = _Harness(
-        created_run=_run(),
-        transitioned_run=_run(RunState.RUNNING, hermes_run_id="hermes-1"),
-    )
+def test_start_research_enqueues_a_queued_run_via_run_service_create_and_never_calls_hermes() -> None:
+    harness = _Harness(created_run=_run())
     identity = _identity("runs:write")
     payload = {"goal": "Compare the two methods", "budget_thb": 8.0, "max_minutes": 25}
 
@@ -202,32 +187,28 @@ def test_start_research_checks_admission_then_runs_idempotently_and_publishes_st
         harness.services.start_research(identity, payload, "request-42")
     )
 
-    assert result == {"run_id": "run-1", "state": "running"}
-    assert [call[0] for call in harness.calls] == [
-        "cycle_for_lab",
-        "admission.check",
+    assert result == {"run_id": "run-1", "state": "queued"}
+    assert [call[0] for call in harness.calls] == ["admission.check", "runs.create"]
+    assert harness.calls[0] == ("admission.check", identity, payload, "request-42")
+    assert harness.calls[1] == (
         "runs.create",
-        "cycle.run",
-        "runs.transition",
-        "events.publish_event",
-    ]
-    assert harness.calls[1] == ("admission.check", identity, payload, "request-42")
-    assert harness.calls[2] == (
-        "runs.create", identity, "request-42", {"max_minutes": 25, "budget_thb": 8.0}
-    )
-    assert harness.calls[3] == (
-        "cycle.run",
-        "Compare the two methods",
-        {"idempotency_key": "request-42"},
-    )
-    assert harness.calls[5] == (
-        "events.publish_event",
         identity,
-        "run-1",
-        "run.state",
-        {"from": "queued", "to": "running", "reason": ""},
-        "run-service",
+        "request-42",
+        {
+            "request_payload": {
+                "goal": "Compare the two methods",
+                "inputs": [],
+                "skill_packs": [],
+                "budget": {"thb": 8.0, "max_minutes": 25},
+                "options": {},
+                "channel": "mcp",
+            },
+            "actor": identity.principal,
+            "max_minutes": 25,
+            "budget_thb": 8.0,
+        },
     )
+    assert not any(call[0].startswith("cycle") for call in harness.calls)
 
 
 def test_start_research_leaves_optional_budget_and_max_minutes_unspecified() -> None:
@@ -238,13 +219,28 @@ def test_start_research_leaves_optional_budget_and_max_minutes_unspecified() -> 
         harness.services.start_research(identity, {"goal": "Find evidence"}, "request-43")
     )
 
-    assert harness.calls[1] == (
+    assert harness.calls[0] == (
         "admission.check",
         identity,
         {"goal": "Find evidence"},
         "request-43",
     )
-    assert harness.calls[2] == ("runs.create", identity, "request-43", {})
+    assert harness.calls[1] == (
+        "runs.create",
+        identity,
+        "request-43",
+        {
+            "request_payload": {
+                "goal": "Find evidence",
+                "inputs": [],
+                "skill_packs": [],
+                "budget": {"thb": None, "max_minutes": None},
+                "options": {},
+                "channel": "mcp",
+            },
+            "actor": identity.principal,
+        },
+    )
 
 
 @pytest.mark.parametrize(
@@ -264,19 +260,6 @@ def test_start_research_rejects_untrusted_or_unsupported_fields(
         )
 
     assert harness.calls == []
-
-
-def test_start_research_rejects_a_cycle_for_another_lab_before_admission() -> None:
-    harness = _Harness(cycle_lab="lab-b")
-
-    with pytest.raises(AuthorizationError):
-        asyncio.run(
-            harness.services.start_research(
-                _identity("runs:write"), {"goal": "Research"}, "request-45"
-            )
-        )
-
-    assert [call[0] for call in harness.calls] == ["cycle_for_lab"]
 
 
 def test_get_run_projects_actual_usage_and_pending_approval_event() -> None:
@@ -338,12 +321,12 @@ def test_get_events_and_usage_use_lab_scoped_run_filters() -> None:
     )
 
 
-def test_approve_binds_the_decision_to_the_requested_run() -> None:
+def test_approve_awaits_the_async_approvals_decision_and_binds_it_to_the_run() -> None:
     harness = _Harness()
     identity = _identity("runs:approve")
 
-    result = harness.services.approve(
-        identity, "run-1", "approval-1", "approve", note="Reviewed"
+    result = asyncio.run(
+        harness.services.approve(identity, "run-1", "approval-1", "approve", note="Reviewed")
     )
 
     assert result == {"ok": True}
@@ -445,10 +428,12 @@ def test_start_research_wires_lab_inputs_pack_and_persisted_budget() -> None:
         )
     )
     assert ("artifacts.get", identity, "artifact-1") in harness.calls
-    assert ("runs.create", identity, "request-1", {"budget_thb": 80.0}) in harness.calls
-    cycle = next(call for call in harness.calls if call[0] == "cycle.run")
-    assert cycle[2]["inputs"] == ["artifact-1", "https://example.org/paper"]
-    assert cycle[2]["skill_packs"] == ["general-research"]
+    create_call = next(call for call in harness.calls if call[0] == "runs.create")
+    request_payload = create_call[3]["request_payload"]
+    assert request_payload["inputs"] == ["artifact-1", "https://example.org/paper"]
+    assert request_payload["skill_packs"] == ["general-research"]
+    assert request_payload["channel"] == "mcp"
+    assert create_call[3]["budget_thb"] == 80.0
 
 
 def test_start_research_artifact_input_requires_read_scope() -> None:

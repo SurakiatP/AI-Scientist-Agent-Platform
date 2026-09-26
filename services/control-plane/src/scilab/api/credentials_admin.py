@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from scilab.db import SET_TENANT_SQL, TENANT_SETTING
+from scilab.db import SET_TENANT_SQL, TENANT_SETTING, load_a2a_peer_credential
 from scilab.identity import Identity, credential_digest
 from scilab.tenancy import require_scope
 
@@ -141,3 +141,28 @@ class A2APeerAdminService:
             "scopes": list(_INITIAL_SCOPES),
             "secret": secret,
         }
+
+    def lookup(self, secret: str) -> Mapping[str, Any] | None:
+        """Resolve a peer bearer secret for scilab.api.a2a's per-request peer lookup."""
+        return load_a2a_peer_credential(self.connection, secret)
+
+
+class LabCardLookup:
+    """Public per-Lab Agent Card fields for scilab.api.a2a; tenant-scoped like every Lab row read."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+
+    def lookup(self, lab_id: str) -> dict[str, Any] | None:
+        if not isinstance(lab_id, str) or not lab_id.strip():
+            return None
+        with self.connection.transaction():
+            with self.connection.cursor() as cursor:
+                cursor.execute(SET_TENANT_SQL, (TENANT_SETTING, lab_id))
+                cursor.execute("SELECT name FROM labs WHERE id = %s", (lab_id,))
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        name = _column(row, "name", 0)
+        # ponytail: labs has no description column; synthesize one instead of a migration.
+        return {"name": name, "description": f"SciLab research Lab {name}"}

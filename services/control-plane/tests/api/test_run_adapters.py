@@ -334,6 +334,24 @@ def test_failed_request_write_rolls_back_run_insert() -> None:
     assert database.rows == []
 
 
+def test_submission_stores_web_channel_for_user_principal_and_search_strips_it() -> None:
+    database = _Database()
+    _, submit, search = _adapters(database)
+    submit.create(identity(principal="user:alice"), "web-key", _payload())
+
+    assert database.rows[0]["request_payload"]["channel"] == "web"
+    item = search.list(identity())["items"][0]
+    assert "channel" not in item
+
+
+def test_submission_stores_rest_channel_for_non_user_principal() -> None:
+    database = _Database()
+    _, submit, _ = _adapters(database)
+    submit.create(identity(principal="service:worker"), "rest-key", _payload())
+
+    assert database.rows[0]["request_payload"]["channel"] == "rest"
+
+
 def test_search_applies_state_actor_since_cursor_and_lab_filters() -> None:
     database = _Database()
     clock = _Clock()

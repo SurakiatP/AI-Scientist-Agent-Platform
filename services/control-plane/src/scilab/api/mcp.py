@@ -183,4 +183,6 @@ def create_app(
         _required_text(topic, "topic")
         return f"Research topic: {topic}\nState the question, scope, inputs, and expected evidence."
 
-    return mcp.http_app(transport="streamable-http")
+    # path="/": mounting this app at "/mcp" (see runtime.py) must expose the
+    # endpoint at "/mcp", not "/mcp/mcp" (FastMCP's own default route is "/mcp").
+    return mcp.http_app(transport="streamable-http", path="/")

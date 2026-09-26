@@ -121,24 +121,43 @@
           "type": "integer"
         },
         "llm_cost_thb": {
-          "title": "Llm Cost Thb",
-          "type": "number"
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Llm Cost Thb"
         },
         "compute_cost_thb": {
           "title": "Compute Cost Thb",
           "type": "number"
         },
-    "budget_remaining_thb": {
-      "anyOf": [
-        {
-          "type": "number"
-        },
-        {
-          "type": "null"
-        }
-      ],
+        "budget_remaining_thb": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "title": "Budget Remaining Thb"
-    }
+        },
+        "warning": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Warning"
+        }
       },
       "required": [
         "tokens_in",

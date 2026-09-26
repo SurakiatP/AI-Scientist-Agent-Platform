@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 
 import pytest
 
+from scilab.contracts import RunEvent
 from scilab.hermes import HermesClient
 
 
@@ -325,25 +327,326 @@ def test_stop_posts_to_the_run_stop_endpoint() -> None:
     asyncio.run(scenario())
 
 
-def test_ask_lab_starts_a_run_through_the_runs_api() -> None:
-    async def scenario() -> None:
-        transport = FakeTransport([FakeResponse({"run_id": "run-ask"})])
+def test_ask_lab_is_removed() -> None:
+    assert not hasattr(HermesClient, "ask_lab")
 
-        await client(transport).ask_lab(
-            "lab-a",
-            "What does the evidence show?",
-            idempotency_key="idem-ask",
-            role="Literature",
+
+def test_events_translates_tool_started_and_finished_into_contract_shapes() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        "id: 10",
+                        'data: {"event":"tool.started","run_id":"run-1","tool":"web_search",'
+                        '"preview":"searching evidence"}',
+                        "",
+                        "id: 11",
+                        'data: {"event":"tool.completed","run_id":"run-1","tool":"web_search",'
+                        '"duration":1.2345,"error":false,"preview":"3 results"}',
+                        "",
+                    )
+                )
+            ]
         )
 
-        call = transport.calls[0]
-        assert call["method"] == "POST"
-        assert call["url"] == "https://hermes-a.internal/v1/runs"
-        assert "chat/completions" not in str(call["url"])
-        assert call["headers"]["Idempotency-Key"] == "idem-ask"
-        assert call["json"] == {
-            "input": '{"prompt":"What does the evidence show?","role":"Literature"}'
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": "10",
+                "event": "tool.started",
+                "run_id": "run-1",
+                "data": {
+                    "tool": "web_search",
+                    "args_redacted": {"preview": "searching evidence"},
+                    "duration_ms": 0,
+                    "ok": True,
+                    "error": None,
+                },
+            },
+            {
+                "id": "11",
+                "event": "tool.finished",
+                "run_id": "run-1",
+                "data": {
+                    "tool": "web_search",
+                    "args_redacted": {"preview": "3 results"},
+                    "duration_ms": 1234,
+                    "ok": True,
+                    "error": None,
+                },
+            },
+        ]
+        for message in events:
+            RunEvent(
+                event_id=message["id"],
+                run_id="run-1",
+                lab_id="lab-a",
+                ts=datetime.now(timezone.utc),
+                type=message["event"],
+                seq=1,
+                payload=message["data"],
+                source="hermes",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_events_translates_a_failed_tool_and_redacts_tool_args() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"tool.completed","run_id":"run-1","tool":"shell",'
+                        '"duration":0.5,"error":true,"preview":{"api_key":"must-not-escape"}}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": None,
+                "event": "tool.finished",
+                "run_id": "run-1",
+                "data": {
+                    "tool": "shell",
+                    "args_redacted": {"preview": {"api_key": "[REDACTED]"}},
+                    "duration_ms": 500,
+                    "ok": False,
+                    "error": None,
+                },
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_events_skips_a_malformed_tool_event_with_a_blank_tool_name() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"tool.started","run_id":"run-1","tool":"  ",'
+                        '"preview":"n/a"}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": None,
+                "event": "message",
+                "data": {"event": "tool.started", "run_id": "run-1", "tool": "  ", "preview": "n/a"},
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_events_rejects_a_tool_event_for_another_run() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"tool.started","run_id":"run-2","tool":"web_search",'
+                        '"preview":"x"}',
+                        "",
+                    )
+                )
+            ]
+        )
+        with pytest.raises(ValueError, match="run_id"):
+            [event async for event in client(transport).events("lab-a", "run-1")]
+
+    asyncio.run(scenario())
+
+
+def test_events_translates_subagent_start_and_complete_into_delegation_events() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"subagent.start","run_id":"run-1","subagent_id":"sub-1",'
+                        '"goal":"survey literature","task_count":3}',
+                        "",
+                        'data: {"event":"subagent.complete","run_id":"run-1","subagent_id":"sub-1",'
+                        '"goal":"survey literature","task_count":3,"model":"scilab-test-model",'
+                        '"input_tokens":100,"output_tokens":40,"cost_usd":0.01}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": None,
+                "event": "delegation.started",
+                "run_id": "run-1",
+                "data": {
+                    "delegation_id": "sub-1",
+                    "role": "subagent",
+                    "goal": "survey literature",
+                    "child_count": 3,
+                    "schema_valid": None,
+                },
+            },
+            {
+                "id": None,
+                "event": "delegation.finished",
+                "run_id": "run-1",
+                "data": {
+                    "delegation_id": "sub-1",
+                    "role": "subagent",
+                    "goal": "survey literature",
+                    "child_count": 3,
+                    "schema_valid": None,
+                },
+                "usage": {
+                    "model": "scilab-test-model",
+                    "input_tokens": 100,
+                    "output_tokens": 40,
+                    "cost_usd": 0.01,
+                },
+            },
+        ]
+        for message in events:
+            RunEvent(
+                event_id="evt-1",
+                run_id="run-1",
+                lab_id="lab-a",
+                ts=datetime.now(timezone.utc),
+                type=message["event"],
+                seq=1,
+                payload=message["data"],
+                source="hermes",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_events_delegation_id_falls_back_to_delegation_id_field() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"subagent.start","run_id":"run-1",'
+                        '"delegation_id":"deleg-1","goal":"g"}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events[0]["data"]["delegation_id"] == "deleg-1"
+        assert events[0]["data"]["child_count"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_events_coerces_explicit_nulls_in_delegation_fields() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"subagent.start","run_id":"run-1",'
+                        '"delegation_id":"deleg-1","role":null,"goal":null,'
+                        '"task_count":null}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events[0]["data"] == {
+            "delegation_id": "deleg-1",
+            "role": "subagent",
+            "goal": "",
+            "child_count": 1,
+            "schema_valid": None,
         }
+        RunEvent(
+            event_id="evt-1", run_id="run-1", lab_id="lab-a",
+            ts=datetime.now(timezone.utc), type="delegation.started",
+            seq=1, payload=events[0]["data"], source="hermes",
+        )
+
+    asyncio.run(scenario())
+
+
+def test_events_skips_a_delegation_event_with_unparseable_task_count() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"subagent.start","run_id":"run-1",'
+                        '"delegation_id":"deleg-1","task_count":"lots"}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": None,
+                "event": "message",
+                "data": {
+                    "event": "subagent.start", "run_id": "run-1",
+                    "delegation_id": "deleg-1", "task_count": "lots",
+                },
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_events_skips_a_delegation_event_missing_any_id() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    lines=(
+                        'data: {"event":"subagent.start","run_id":"run-1","goal":"g"}',
+                        "",
+                    )
+                )
+            ]
+        )
+
+        events = [event async for event in client(transport).events("lab-a", "run-1")]
+
+        assert events == [
+            {
+                "id": None,
+                "event": "message",
+                "data": {"event": "subagent.start", "run_id": "run-1", "goal": "g"},
+            }
+        ]
 
     asyncio.run(scenario())
 

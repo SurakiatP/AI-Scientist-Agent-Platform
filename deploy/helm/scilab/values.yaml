@@ -23,7 +23,8 @@ externalSecrets:
   # Names of pre-provisioned Secrets in the release namespace; the chart never
   # stores Secret values. Required application keys are mapped explicitly:
   # postgres: SCILAB_DATABASE_URL
-  # keycloak: SCILAB_OIDC_ISSUER, SCILAB_OIDC_AUDIENCE, SCILAB_OIDC_JWKS_URI
+  # keycloak: SCILAB_OIDC_ISSUER, SCILAB_OIDC_AUDIENCE, SCILAB_OIDC_JWKS_URI,
+  #           SCILAB_KEYCLOAK_REALM_URL, SCILAB_MCP_BASE_URL
   # minio: SCILAB_MINIO_URL, SCILAB_MINIO_ACCESS_KEY, SCILAB_MINIO_SECRET_KEY,
   #        SCILAB_INPUT_BUCKET, SCILAB_ARTIFACT_BUCKET
   # nats: SCILAB_NATS_URL; opa: SCILAB_OPA_URL
@@ -40,6 +41,9 @@ externalSecrets:
 api:
   replicas: 1
   port: 8000
+  # CIDRs of trusted reverse proxies; uvicorn --forwarded-allow-ips honors only
+  # these. Empty means trust none.
+  trustedProxyCidrs: []
   ingress:
     enabled: false
     className: ""
@@ -48,6 +52,15 @@ api:
 
 labOperator:
   replicas: 1
+
+# OpenSandbox broker/server reached by the run worker and Hermes pods.
+openSandbox:
+  serverPort: 8080
+
+# THB-per-1M-token prices keyed by model name; no defaults, unpriced models
+# report cost null with a warning instead of failing the Run.
+metering:
+  modelPricesThb: {}
 web:
   replicas: 1
   port: 3000
